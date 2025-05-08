@@ -1,7 +1,6 @@
 """ move from the physical 2D board representation, with neighbours orthogaonl, to the list/ vector representation
 """
 
-import numpy as np
 from enum import Enum
 
 
@@ -15,54 +14,50 @@ class Directions(Enum):
         self.i = i
         self.j = j
 
-list_vec = [0] * 52
-numpy_arr = -1 * np.ones((8, 8), dtype=int)
+# the 52 board locations as coordinates (i, j):
+bad_locs = {
+    (0, 0), (0, 1), (1, 0),
+    (7, 0), (7, 1), (6, 0),
+    (0, 7), (0, 6), (1, 7),
+    (7, 7), (6, 7), (7, 6),
+}
 
-all_adj = []
+location_to_coordinates = [0] * 52
+coordinates_to_location = {}
+orthogonal_neighbors = {}
 _count = 0
 
 for _i in range(8):
     for _j in range(8):
-        if (_i + _j) < 2:
+        _loc = (_i, _j)
+
+        if _loc in bad_locs:
             continue
 
-        if ((7 - _i) + (7 - _j)) < 2:
-            continue
+        location_to_coordinates[_count] = _loc
+        coordinates_to_location[_loc] = _count
 
-        if ((7 - _i) + _j) < 2:
-            continue
+        _neighbors = []
 
-        if (_i + (7 - _j)) < 2:
-            continue
+        if _i > 0:
+            if (_i - 1, _j) not in bad_locs:
+                _neighbors.append((_i - 1, _j))
 
-        numpy_arr[_i, _j] = _count
-        list_vec[_count] = (_i, _j)
+        if _i < 7:
+            if (_i + 1, _j) not in bad_locs:
+                _neighbors.append((_i + 1, _j))
+
+        if _j > 0:
+            if (_i, _j - 1) not in bad_locs:
+                _neighbors.append((_i, _j - 1))
+
+        if _j < 7:
+            if (_i , _j + 1) not in bad_locs:
+                _neighbors.append((_i, _j + 1))
+
+        orthogonal_neighbors[(_i, _j)] = set(_neighbors)
         _count += 1
 
-
-zipped_loc_to_coords = list(zip(*list_vec))
+zipped_loc_to_coords = list(zip(*location_to_coordinates))
 loci = list(zipped_loc_to_coords[0])
 locj = list(zipped_loc_to_coords[1])
-
-# now check neighbours
-all_neighbours = {}
-
-for _i in range(8):
-    for _j in range(8):
-        current_neighbours = []
-        curr = numpy_arr[_i, _j]
-
-        if curr < 0:
-            continue
-
-        for _dir in Directions:
-            _ti = _i + _dir.i
-            _tj = _j + _dir.j
-
-            if ((_ti >= 0) == (_ti < 8)) and ((_tj >= 0) == (_tj < 8)):
-                target = numpy_arr[_ti, _tj]
-                if target >= 0:
-                    current_neighbours.append(target)
-
-        all_neighbours[curr] = set(current_neighbours)
-

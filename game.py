@@ -1,85 +1,47 @@
 """
 The main game file for patterns.
 
-#####################
-State explanation:
-state is a list of size 66:
+### STATE #####################################
+State is represented naturally through the use of an 8x8 board, with the corners ignored.
 
-Entries 0-51 represent the state of locations 1-52 on the boards:
+The numbers  0 -  5 represent unflipped colors.
+The numbers  6 - 11 represent flipped colors for the active player.
+The numbers 12 - 17 represent flipped colors for the passive player.
 
-0-5 = unflipped colors
-6-11 = flipped for ACTIVE player
-12-17 = flipped for PASSIVE player
+This board state is supplemented by 2 vectors to denote the order in which each color group is taken
+by the active/ passive player. Here, 0 implies that a player has not taken that color yet, which 1-6 implies
+taken at that order.
 
-By having active and passive players in this way, we avoid having to inform whos turn it is. It is
-always the turn of the active player.
+Finally, the bowl tokens for each player are stored. This completes the state store.
 
-Entries 52-63 represent the order in which each player took a color
+###############################################
 
-52-57 represent colors 0-5 for the active player and 0 means untaken, 1-6 mean taken in that order.
-58-63 represent colors 0-5 for passive player and 0 means untaken, 1-6 means taken in that order.
-
-64 represents the hand token of the active player, values 0-5.
-65 represents the hand token of the passive player, values 0-5.
-
-Note that there is a slight oddness in that the initial state will have 0 0 for 64-65, but
-we assume that this is inconsequential for choosing initial move.
-#################
-
-
-#####################
-Action space: 107 distinct actions.
- #  0 -  51:  place bowl token in given location
-        # 52 - 103: flip piece at given location
-        #      104: choose color 0
-        #      105: choose color 1
-        #      106: choose to play first and defer first turn
-
-A list of 106 actions that can ever be taken.
-
-0   -  51: Place the active bowl token at the indicated location,
-52  - 103: Flip the token at the indicated location (action % 52)
-      104: Choose to stick with bowl token 0 on turn 1.
-      105: Choose swap bowl tokens on turn 1.
-      106: Choose to play first, force player 2 to choose bowl token.
+### ACTION ####################################
+The action space is far simpler.
+0 -  51:  place bowl token in given location
+52 - 103: flip piece at given location
+104: choose color 0
+105: choose color 1
+106: choose to play first and defer first turn
 
 NOTE:
 Once a player has no available placing moves on their turn, only flipping moves are allowed from that point on.
 
 Once a player cannot flip anymore, all remaining moves are taken in one go. Ie all remaining possible
 flips are flipped.
-#####################
 
-#####################
-State space: list of size 66 (may change tensor representation):
-
-Indices 0 - 51 represent the state of the tokens at locations 1-52 on the board.
- 0 -  5: unflipped token of this color
- 6 - 11: flipped token of (this % 6) color for the ACTIVE player
-12 - 17: flipped token of (this % 6) color for the PASSIVE player
-
-Indices 52 - 57 represent the order taken of each color for the ACTIVE player.
-52: Color 0 was not taken yet (0) or was taken first (1) to sixth (6) for the ACTIVE player
-...
-57: Color 5 was not taken yet (0) or was taken first (1) to sixth (6) for the ACTIVE player
-
-Indices 58 - 63 represent the order taken of each color for the PASSIVE player.
-
-Index 64 represent the color of the bowl token for the active player. Before choice, set to 0
-Index 65 represents the color of the bowl token for the passive player. Before choice, set to 1
-#####################
-
-todo
-if placing and flipping have the same affect, BAN the placing action to reduce the action space.
-move to enums for the colors will be easier.
+###############################################
 """
 import random
 import numpy as np
-from int_to_board import all_neighbours, loci, locj
+from typing import Optional, Self
+
+
+from int_to_board import orthogonal_neighbors, loci, locj, location_to_coordinates, coordinates_to_location
 
 
 class Patterns:
-    def __init__(self):
+    def __init__(self, clone_game: Optional[Self] = None) -> None:
         self.action_space = (107,)
         self.state_space = (66,)
 
@@ -89,10 +51,15 @@ class Patterns:
         self.active_color_order = [0] * 6
         self.passive_color_order = [0] * 6
 
+        # setting the initial game state for first couple of turns:
         self.turn_number = 1
+        self.is_game_started = False
+        self.first_turn_passed = False
+        self.is_terminal = False
+        self.result: Optional[int] = None
 
-        # The active player - can be 0 or 1.
-        self.player = 0
+        # The active player can be 1 or -1:
+        self.player = 1
 
         # track locations that have been permanently claimed by a player:
         self.flipped_locations = set()
@@ -101,26 +68,83 @@ class Patterns:
         self.is_no_more_placing = False
 
         # active and passive bowl tokens:
-        self.active_hand_piece, self.passive_hand_piece = 0, 1
+        self.active_bowl_token, self.passive_bowl_token = 0, 1
 
-        # dictionary of colour: list[int locations]
+        # dictionary of colour: list[(int, int) locations]
         self.active_color_groups = {_col: [] for _col in range(6)}
         self.passive_color_groups = {_col: [] for _col in range(6)}
 
-        # Track locations that are orthogonal to taken color groups:
-        self.active_orthogonals = {}
-        self.passive_orthogonals = {}
+        # store dictionary of color: potential locations for placing:
+        self.active_placing_groups = {_col: set(location_to_coordinates) for _col in range(6)}
+        self.passive_placing_groups = {_col: set(location_to_coordinates) for _col in range(6)}
+
+        # likewise store dictionary of color: potential flips:
+        self.active_flipping_groups = {_col: set() for _col in range(6)}
+        self.passive_flipping_groups = {_col: set() for _col in range(6)}
+
+        # and store and update all possible flipping moves, not keyed by color:
+        self.active_flipping_actions= set()
+        self.passive_flipping_actions = set()
 
         # Track the next color-group order token to be placed:
         self.active_placing_number, self.passive_placing_number = 1, 1
 
-        # Note that the active and passive states will differ. More efficient to track separately.
-        self.active_state = [0] * 66
-        self.passive_state = [0] * 66
+        if clone_game is not None:
+            self.clone(clone_game)
 
-        self.initialize_states() # populate an initial random state:
+        else:
+            self.initialize_boards() # populate an initial random state:
 
-    def initialize_states(self):
+    def clone(self, patterns_game: Self) -> None:
+        """ populate this game with an identical copy:
+        """
+        # track the board as well, as this will be used in the NN implementation:
+        self.active_board = patterns_game.active_board
+        self.passive_board = patterns_game.passive_board
+        self.active_color_order = patterns_game.active_color_order
+        self.passive_color_order = patterns_game.passive_color_order
+
+        # setting the initial game state for first couple of turns:
+        self.turn_number = patterns_game.turn_number
+        self.is_game_started = patterns_game.is_game_started
+        self.first_turn_passed = patterns_game.first_turn_passed
+        self.is_terminal = patterns_game.is_terminal
+        self.result = patterns_game.result
+
+        # The active player can be 1 or -1:
+        self.player = patterns_game.player
+
+        # track locations that have been permanently claimed by a player:
+        self.flipped_locations = patterns_game.flipped_locations
+
+        # Once this flag is True, no more placing actions are allowed for either player:
+        self.is_no_more_placing = patterns_game.is_no_more_placing
+
+        # active and passive bowl tokens:
+        self.active_bowl_token = patterns_game.active_bowl_token
+        self.passive_bowl_token = patterns_game.passive_bowl_token
+
+        # dictionary of colour: list[(int, int) locations]
+        self.active_color_groups = patterns_game.active_color_groups
+        self.passive_color_groups = patterns_game.passive_color_groups
+
+        # store dictionary of color: potential locations for placing:
+        self.active_placing_groups = patterns_game.active_placing_groups
+        self.passive_placing_groups = patterns_game.passive_placing_groups
+
+        # likewise store dictionary of color: potential flips:
+        self.active_flipping_groups = patterns_game.active_flipping_groups
+        self.passive_flipping_groups = patterns_game.passive_flipping_groups
+
+        # and store and update all possible flipping moves, not keyed by color:
+        self.active_flipping_actions = patterns_game.active_flipping_actions
+        self.passive_flipping_actions = patterns_game.passive_flipping_actions
+
+        # Track the next color-group order token to be placed:
+        self.active_placing_number = patterns_game.active_placing_number
+        self.passive_placing_number = patterns_game.passive_placing_number
+
+    def initialize_boards(self):
         """ create an initial random assortment of colours, missing 1, 2 in the middle:
         """
         # There are 9 of each color in total, but the locations of the final token in each color are either in the
@@ -131,16 +155,23 @@ class Patterns:
         # middle tiles always start with colors 2 - 5, with 0 and 1 starting in the player bowls WLOG:
         middle = [2, 3, 4, 5]
         random.shuffle(middle)
-        initial_state = (
-                tiles[:21] + middle[:2] + tiles[21:27] + middle[2:] + tiles[27:]
-                + [0] * 12 + [0, 1]
-        )
+        initial_state = tiles[:21] + middle[:2] + tiles[21:27] + middle[2:] + tiles[27:]
 
         self.active_board[loci, locj] = initial_state
         self.passive_board[loci, locj] = initial_state
 
-        self.active_state = [_ for _ in initial_state]
-        self.passive_state = [_ for _ in initial_state]
+    def calculate_score(self) -> tuple[int, int]:
+        """ return the score for each player in the current state by looking at the
+        color orders and the color groups
+        """
+        active_score = 0
+        passive_score = 0
+
+        for _color, (aorder, porder) in enumerate(zip(self.active_color_order, self.passive_color_order)):
+            active_score += len(self.active_color_groups[_color]) * aorder
+            passive_score += len(self.passive_color_groups[_color]) * porder
+
+        return active_score, passive_score
 
     def get_actions(self) -> list[int]:
         """ a legal action is:
@@ -148,160 +179,186 @@ class Patterns:
         2. Flip over a piece next to one of your own
         """
         # Either choose a color or pass the choice:
-        if self.turn_number == 1:
+        if not self.is_game_started:
             return [104, 105, 106]
 
         # if a hand piece has not been chosen yet, the first player passed the choice:
-        if self.active_hand_piece is None:
+        if self.first_turn_passed:
             return [104, 105]
 
         if self.is_no_more_placing:
             placing_actions = []
 
         else:
-            placing_actions = self.get_placing_actions()
+            placing_actions = [coordinates_to_location[_coord]
+                               for _coord in self.active_placing_groups[self.active_bowl_token]]
 
             # if no placing locations are possible, then set the flag
             if not placing_actions:
                 self.is_no_more_placing = True
 
-        flipping_actions = self.get_flipping_actions()
+        flipping_actions = self.active_flipping_actions
 
-        # todo: remove placing actions that are contained implicitly in the flipping actions. That is,
-        # if your placing action would result in the same state as the flipping action
-
-        return placing_actions + flipping_actions
-
-    def get_placing_actions(self) -> list[int]:
-        """ Rules:
-        1. you cannot place a piece adjacent to an opponents piece of the same color
-        2. you cannot place a piece in a location containing another flipped piece of any type
-        3. A piece sharing a color with an existing color group may only be placed adjacent to a piece from
-                that color group.
-
-        Return list of the INTEGER LOCATIONS, not the actions that these relate to.
-        In particular, return list of all locations orthogonal to the active color group of this color, remove
-        those locations that are flipped and remove those locations that are adjacent to the passive color group
-        """
-        return list(self.active_orthogonals.get(self.active_hand_piece, set(range(52)))
-                    - self.passive_orthogonals.get(self.active_hand_piece, set())
-                    - self.flipped_locations)
-
-    def get_flipping_actions(self) -> list[int]:
-        """ Flips are:
-        1. Orthogonal to an already-flipped piece,
-        2. The same colour as the flipped piece,
-        3. Not next to an opponents piece of the same colour.
-        """
-        flip_moves = []
-
-        # iterate over the populated color groups:
-        for _color, orthogonal_locations in self.active_orthogonals.items():
-            # unflipped orthogonals of the same color:
-            matching_locations = [loc + 52 for loc in orthogonal_locations
-                                  # todo change to board not state:
-                                  if self.active_state[loc] == _color
-                                  if loc not in self.passive_orthogonals.get(_color, set())]
-
-            flip_moves.extend(matching_locations)
-
-        return flip_moves
+        return placing_actions + list(flipping_actions)
 
     def swap_players(self) -> None:
         """ swap the player and update all the pointers to the correct attributes
         """
         self.turn_number += 1
-        self.player = (self.player + 1) % 2
+        self.player *= -1
 
         # switch active and passive:
-        self.active_hand_piece, self.passive_hand_piece = self.passive_hand_piece, self.active_hand_piece
+        self.active_bowl_token, self.passive_bowl_token = self.passive_bowl_token, self.active_bowl_token
         self.active_placing_number, self.passive_placing_number = self.passive_placing_number, self.active_placing_number
         self.active_color_groups, self.passive_color_groups = self.passive_color_groups, self.active_color_groups
-        self.active_orthogonals, self.passive_orthogonals = self.passive_orthogonals, self.active_orthogonals
-        self.active_state, self.passive_state = self.passive_state, self.active_state
         self.active_board, self.passive_board = self.passive_board, self.active_board
         self.active_color_order, self.passive_color_order = self.passive_color_order, self.active_color_order
+        self.active_placing_groups, self.passive_placing_groups = self.passive_placing_groups, self.active_placing_groups
+        self.active_flipping_groups, self.passive_flipping_groups = self.passive_flipping_groups, self.active_flipping_groups
+        self.active_flipping_actions, self.passive_flipping_actions = self.passive_flipping_actions, self.active_flipping_actions
 
-    def step(self, action: int) -> None:
+    def step(self, action: int) -> tuple[bool, Optional[int]]:
         """ progress the state according to the action
         """
-        location = None
+
+        # Simply pass choice of initial bowl token to the other player:
+        if action == 106:
+            # flag to indicate it is no longer the first turn:
+            self.is_game_started = True
+
+            # set flag to indicate turn passed:
+            self.first_turn_passed = True
 
         # Choose which tile you want to play with:
         if action in [104, 105]:
-            # color is always either 0 or 1 by construction:
-            acol = action - 104
-            pcol = (action + 1) % 2
+            # flag to indicate it is no longer the first turn:
+            self.is_game_started = True
+
+            # remove potential flag for token choice being passed:
+            self.first_turn_passed = False
 
             # assign bowl pieces to each player:
-            self.active_hand_piece = acol
-            self.passive_hand_piece = pcol
+            self.active_bowl_token = action % 2
+            self.passive_bowl_token = (action + 1) % 2
 
-            # update active and passive states:
-            self.active_state[-2] = acol
-            self.active_state[-1] = pcol
-            self.passive_state[-2] = pcol
-            self.passive_state[-1] = acol
-
-
-        # placing moves:
-        if action < 52:
-            location = action
-
-            # if piece is the first in the colour group, update ORDER TAKEN in state:
-            if len(self.active_color_groups[self.active_hand_piece]) == 0:
-                # update the ORDER TAKEN in state:
-                # active_state_index = 52 + self.active_hand_piece
-                #
-                # self.active_state[active_state_index] = self.active_placing_number
-                # self.passive_state[active_state_index + 6] = self.active_placing_number
-                #
-                self.active_color_order[self.active_hand_piece] = self.active_placing_number
-
-                # increment the scoring number (initialized at 1):
-                self.active_placing_number += 1
-
-            # update the color group by appending location:
-            self.active_color_groups[self.active_hand_piece].append(location)
-
-            # the new hand piece becomes the color that was picked up:
-            # picked_up_color = self.active_state[location]
-            # self.active_state[location] = self.active_hand_piece + 6
-            # self.passive_state[location] = self.active_hand_piece + 12
-
-            # update board for both players:
-            boardi, boardj = loci[location], locj[location]
-            picked_up_color = self.active_board[boardi, boardj]
-            self.active_board[boardi, boardj] = self.active_hand_piece + 6
-            self.passive_board[boardi, boardj] = self.active_hand_piece + 12
-            self.active_hand_piece = picked_up_color
-
-            # # the state indices 64-65 represent the hand pieces:
-            # self.active_state[64] = self.active_hand_piece
-            # self.passive_state[65] = self.active_hand_piece
-
-        if 52 <= action < 104:
+        # actions that represent a change to the board state:
+        if action < 104:
             location = action % 52
-            color_to_be_flipped = self.active_state[location]
+            coords = loci[location], locj[location]
 
-            # if you are flipping, the color group must already be established:
-            self.active_color_groups[color_to_be_flipped].append(location)
+            if action < 52:
+                self.active_bowl_token, self.active_board[coords], self.passive_board[coords] = (self.active_board[coords],
+                                                                                                 self.active_bowl_token,
+                                                                                                 self.active_bowl_token)
 
-            # only thing that changes is that the color is flipped.
-            self.active_state[location] += 6
-            self.passive_state[location] += 12
+            # function to update the various orthogonals and valid moves attributes:
+            self.update_locations(coords)
 
-        # add the flipped or placed location to the set of used-up values:
-        if location is not None:
-            self.flipped_locations.add(location)
+        # if there are no flips and either no more placing actions OR placing actions have stopped:
+        if len(self.passive_flipping_actions) == 0:
+            if (len(self.passive_placing_groups[self.passive_bowl_token]) == 0) or self.is_no_more_placing:
+                self.take_all_flips()
+                p1_score, p2_score = self.calculate_score()
+                result = 0
 
-            # set union the relevant orthogonals set:
-            color_group = self.active_state[location] % 6
+                if p1_score > p2_score:
+                    result = 1
 
-            # update the active orthogonals dictionary with the neighbours of the new flipped location:
-            self.active_orthogonals.update(
-                {color_group: self.active_orthogonals.get(color_group, set()) | all_neighbours[location]}
-            )
+                if p1_score < p2_score:
+                    result = -1
+
+                self.is_terminal = True
+                self.result = result
+
+                return True, result
 
         # swap the player attributes:
         self.swap_players()
+
+        return False, None
+
+    def update_locations(self, coords: tuple[int, int]) -> None:
+        """ Update the active and passive location-sensitive attributes, to
+        allow the calculation of future moves to be far simpler
+
+        1. Update the active color group, and introduce it if necessary
+        2. Update the orthogonals, the placing groups and the flipping groups as necessary
+        3.
+        """
+        # Determine the color of the token that was flipped or placed:
+        token_color = int(self.active_board[coords])
+        self.update_board(coords)
+        self.remove_new_location(coords)
+        self.update_color_groups(coords, token_color)
+        self.update_placing_and_flipping_groups(coords, token_color)
+
+    def update_board(self, coords: tuple[int, int]) -> None:
+        # Flip the color that has been placed:
+        self.active_board[coords] += 6
+        self.passive_board[coords] += 12
+
+        # Add the new token to the set of flipped locations:
+        self.flipped_locations.add(coords)
+
+    def remove_new_location(self, coords: tuple[int, int]) -> None:
+        # Remove the flipped location from all passive and active placing and flipping locations and orthogonals:
+        coords_set = {coords}
+
+        for _col in range(6):
+            self.active_flipping_groups[_col] -= coords_set
+            self.active_placing_groups[_col] -= coords_set
+            self.passive_flipping_groups[_col] -= coords_set
+            self.passive_placing_groups[_col] -= coords_set
+
+    def update_color_groups(self, coords: tuple[int, int], color: int) -> None:
+        # If the token is the first in the color group, update order taken and create initial (empty) placing group:
+        if len(self.active_color_groups[color]) == 0:
+            self.active_color_order[color] = self.active_placing_number
+            self.active_placing_number += 1
+            self.active_placing_groups[color] = set()
+
+        # Add the newly placed token to the relevant color group:
+        self.active_color_groups[color].append(coords)
+
+    def update_placing_and_flipping_groups(self, coords: tuple[int, int], color: int) -> None:
+        # empty token orthogonals:
+        token_orthogonals = orthogonal_neighbors[coords] - self.flipped_locations
+
+        # detect spots that exist in both the passive and active placing groups:
+        if self.passive_color_order[color] == 0:
+            mutually_orthogonal = set()
+
+        else:
+            mutually_orthogonal = self.passive_placing_groups[color] & token_orthogonals
+
+        # Remove the mutual orthogonals from both the passive and the active placing groups:
+        self.passive_placing_groups[color] -= mutually_orthogonal
+        self.passive_flipping_groups[color] -= mutually_orthogonal
+        legal_places = token_orthogonals - mutually_orthogonal
+
+        # Remove anything that doesn't match color for the active flipping group:
+        legal_flips = set([_lp for _lp in legal_places if self.active_board[_lp] == color])
+
+        # add the empty and legal places to the active placing groups:
+        self.active_placing_groups[color] |= legal_places
+
+        # add the empty, legal and matching spaces to the flipping groups:
+        self.active_flipping_groups[color] |= legal_flips
+
+        # Remove the new location action represented by the coordinates:
+        self.active_flipping_actions -= {coordinates_to_location[coords] + 52}
+        self.passive_flipping_actions -= {coordinates_to_location[coords] + 52}
+
+        # add the new flips enabled by the new location:
+        self.active_flipping_actions |= set([coordinates_to_location[_coord] + 52 for
+                                             _coord in legal_flips])
+
+    def take_all_flips(self) -> None:
+        """ It has been determined that the passive player will have no moves remaining. Take all
+        remaining flipping moves as the active player now and end the game.
+        """
+        for _col in range(6):
+            for _location in self.active_flipping_groups[_col]:
+                self.active_board[_location] += 6
+                self.passive_board[_location] += 12
+                self.active_color_groups[_col].append(_location)
