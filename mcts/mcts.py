@@ -75,13 +75,18 @@ class Node:
         exp_demaxed_logits = np.exp(logits - np.max(logits))
         return exp_demaxed_logits / exp_demaxed_logits.sum()
 
-    def expand(self) -> None: # list[tuple]:
+    def expand(self) -> Self:
         """ expand this node by creating and assigning child nodes:
          """
-        # do not proceed if game is terminal:
+        # If the leaf state is terminal:
         if self.result is not None:
-            return
+            return self
 
+        # 1st visit, do not create children, simply request inference:
+        if self.visit_count == 0:
+            return self
+
+        # 2nd visit, populate children, return random child:
         for _it, _move in enumerate(self.possible_actions):
             # Create a new game:
             game = Patterns(self.parent.game)
@@ -97,6 +102,10 @@ class Node:
             )
 
             self.children.append(new_node)
+
+        # note there will be at least one child as otherwise the game is terminal
+        # and result would be populated:
+        return random.choice(self.children)
 
     def get_tensor_state(self) -> torch.Tensor:
         """ Use the game state to form a torch tensor that can be used to eval the position
@@ -217,21 +226,6 @@ class Tree:
 
         return node
 
-    @staticmethod
-    def expand_leaf(leaf_node: Node) -> Node:
-        """ logic for which child requires eval of state
-        """
-        # Leaves are only expanded after they are visited a second time. The first visit is purely an eval of the
-        # state by the NN:
-        if leaf_node.visit_count > 0:
-            leaf_node.expand()
-
-            # Note: random choice of child introduces exploration:
-            if leaf_node.children is not None:
-                leaf_node = random.choice(leaf_node.children)
-
-        return leaf_node
-
     def calculate_root_puct_scores(self) -> np.ndarray[float]:
         """ Upon creation of the search tree, dirichlet noise is assigned to the root node that will
         bias the search tree in relatively few directions for the duration of the explorations. Once the
@@ -308,11 +302,13 @@ class Tree:
             node.visit_count += 1
             self.update_node_child_scores(node)
             node = node.parent
+
+            # flip the sign of the reward:
             reward *= -1
 
             self.log = (node, self.root_node)
 
-    def get_terminal_positions(self) -> list[tuple]:
+    def store_complete_game(self) -> list[tuple]:
         """ Once the root node is in a terminal state, store the various states for use in the replay buffer:
         """
         result = self.root_node.result
@@ -321,14 +317,14 @@ class Tree:
             raise ValueError("this function should only be called on a completed game!")
 
         nod = self.root_node
-        full_game_backwards = []
+        full_game_backwards = [0] * self.root_node.game.turn_number
 
         # work backwards up through the tree, storing the states and the visit counts:
         while nod:
             # todo: weighted average of results from a given position?
 
             # save list of game states, child visit counts, and _result:
-            full_game_backwards.append((nod.state_tuple, nod.child_visit_counts, result))
+            full_game_backwards[nod.game.turn_number] = (nod.state_tuple, nod.child_visit_counts, result)
             nod = nod.parent
 
         return full_game_backwards
