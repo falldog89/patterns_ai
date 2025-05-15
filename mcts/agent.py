@@ -113,10 +113,11 @@ class Agent:
         tensor_states = []
 
         # iterate over trees in series:
-        for _tree in self.trees:
+        for _it, _tree in enumerate(self.trees):
             # flow to current leaf following argmax of puct scores:
             leaf_node = _tree.get_leaf_node()
 
+            print(_it)
             # leaf node is unchanged if terminal or first visit, else random child:
             leaf_node = leaf_node.expand()
 
@@ -136,9 +137,13 @@ class Agent:
         # size is (num_trees, 102, 8 8)
         tensor_stack = torch.stack(tensor_states)
 
-        # two head inference results:
-        with torch.inference_mode():
-            value_stack, policy_stack = self.network(tensor_stack.float().to(self.device, non_blocking=True))
+        # # two head inference results:
+        # with torch.inference_mode():
+        #     value_stack, policy_stack = self.network(tensor_stack.float().to(self.device, non_blocking=True))
+
+        # test just on cpu for now:
+        value_stack = -1. + 2. * torch.rand((tensor_stack.shape[0]))
+        policy_stack = torch.rand((tensor_stack.shape[0], 107))
 
         value_stack = value_stack.to("cpu", non_blocking=True).numpy()
         policy_stack = policy_stack.to("cpu", non_blocking=True).numpy()
@@ -148,22 +153,9 @@ class Agent:
         for _leaf, _tree, _val, _pol in zip(leaf_nodes, relevant_trees, value_stack, policy_stack):
             # value score is normalized in the network to be between -1 and 1:
             _leaf.value_score = _val
-
-            # if len(_leaf.possible_actions) > 0:
-            # policy vector is logits for a classifier, so must be soft-maxed:
-            # softmax_policy = self.numpy_softmax(_pol[_leaf.possible_actions])
-
-            # todo create an assignment function that either assigns
-            # to full policy if there is no game, else to pol
-            _leaf.assign_policy(_pol) = _pol
-            # _leaf.policy_vector = softmax_policy
+            # either the game is already assigned to leaf, in which case this
+            # can be resolved in leaf, or store whole policy until game is assigned.
+            _leaf.assign_policy(_pol)
 
             # if the leaf is terminal, this will be back-propagated instead of the value result:
             _tree.back_propagate(_leaf)
-
-    @staticmethod
-    def numpy_softmax(logits: np.ndarray[float]) -> np.ndarray[float]:
-        """ numpy implementation given the slowness of torch tensors for allocation
-        """
-        exp_demaxed_logits = np.exp(logits - np.max(logits))
-        return exp_demaxed_logits / exp_demaxed_logits.sum()

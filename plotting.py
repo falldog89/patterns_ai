@@ -17,11 +17,10 @@ from int_to_board import location_to_coordinates
 class PatternPlotter:
     def __init__(self,
                  game: Patterns,
-                 fig_size: tuple[float, float]=(16, 8)) -> None:
+                 ) -> None:
         """ check thorughout for (x, y) versus (i, j)u
         """
         self.game = game
-        self.fig_size = fig_size
         self.axis_xlimits = [-6.5, 13.5]
         self.axis_ylimits = [-4.5, 11.5]
 
@@ -256,12 +255,12 @@ class PatternPlotter:
                           horizontalalignment='center',
                           verticalalignment='center', )
 
-    def plot(self) -> None:
+    def plot(self, fig_size: tuple[float, float]=(10, 7)) -> None:
         """ plot the board according to the state:
 
         plot the player 1 and player 2 hand tiles somewhere for ease, as well as the colours they have taken so far!
         """
-        fig, ax = plt.subplots(figsize=self.fig_size)
+        fig, ax = plt.subplots(figsize=fig_size)
 
         self.add_player_labels(ax)
         self.add_bowls(ax)

@@ -72,23 +72,20 @@ class Patterns:
         self.is_no_more_placing = False
 
         # active and passive bowl tokens:
-        self.active_bowl_token, self.passive_bowl_token = 0, 1
+        self.active_bowl_token, self.passive_bowl_token = 0, 1#
+
+        # dictionary of color: list[(int, int) coordinates showing orthogonals to existing groups:
+        # occupied locations are removed.
+        self.active_orthogonal_groups = {_col: set() for _col in range(6)}
+        self.passive_orthogonal_groups = {_col: set() for _col in range(6)}
 
         # dictionary of colour: list[(int, int) locations]
         self.active_color_groups = {_col: [] for _col in range(6)}
         self.passive_color_groups = {_col: [] for _col in range(6)}
 
-        # store dictionary of color: potential locations for placing:
-        self.active_placing_groups = {_col: set(location_to_coordinates) for _col in range(6)}
-        self.passive_placing_groups = {_col: set(location_to_coordinates) for _col in range(6)}
-
         # likewise store dictionary of color: potential flips:
         self.active_flipping_groups = {_col: set() for _col in range(6)}
         self.passive_flipping_groups = {_col: set() for _col in range(6)}
-
-        # and store and update all possible flipping moves, not keyed by color:
-        self.active_flipping_actions = set()
-        self.passive_flipping_actions = set()
 
         # Track the next color-group order token to be placed:
         self.active_placing_number, self.passive_placing_number = 1, 1
@@ -121,15 +118,13 @@ class Patterns:
 
         # set copy:
         self.flipped_locations = set(patterns_game.flipped_locations)
-        self.active_flipping_actions = set(patterns_game.active_flipping_actions)
-        self.passive_flipping_actions = set(patterns_game.passive_flipping_actions)
 
         # dictionary copy: must deep copy by explicitly setting lists within
         self.active_color_groups = {_col: _val[:] for _col, _val in patterns_game.active_color_groups.items()}
         self.passive_color_groups = {_col: _val[:] for _col, _val in patterns_game.passive_color_groups.items()}
 
-        self.active_placing_groups = {_col: set(_val) for _col, _val in patterns_game.active_placing_groups.items()}
-        self.passive_placing_groups = {_col: set(_val) for _col, _val in patterns_game.passive_placing_groups.items()}
+        self.active_orthogonal_groups = {_col: set(_val) for _col, _val in patterns_game.active_orthogonal_groups.items()}
+        self.passive_orthogonal_groups = {_col: set(_val) for _col, _val in patterns_game.passive_orthogonal_groups.items()}
 
         self.active_flipping_groups = {_col: set(_val) for _col, _val in patterns_game.active_flipping_groups.items()}
         self.passive_flipping_groups = {_col: set(_val) for _col, _val in patterns_game.passive_placing_groups.items()}
@@ -180,16 +175,27 @@ class Patterns:
             placing_actions = []
 
         else:
-            placing_actions = [coordinates_to_location[_coord]
-                               for _coord in self.active_placing_groups[self.active_bowl_token]]
+            # if the active bowl token color group has not yet been taken:
+            if self.active_color_order[self.active_bowl_token] == 0:
+                # place in any unoccupied spot:
+                empty_spaces = (set(location_to_coordinates) - self.flipped_locations
+                                - self.passive_orthogonal_groups[self.active_bowl_token])
+
+            else:
+                # place next to the existing group:
+                empty_spaces = (self.active_orthogonal_groups[self.active_bowl_token]
+                                - self.passive_orthogonal_groups[self.active_bowl_token])
+
+            placing_actions = [coordinates_to_location[_coord] for _coord in empty_spaces]
 
             # if no placing locations are possible, then set the flag
             if not placing_actions:
                 self.is_no_more_placing = True
 
-        flipping_actions = self.active_flipping_actions
+        flipping_actions = [coordinates_to_location[_coord] + 52 for
+                            _key, _val in self.active_flipping_groups.items() for _coord in _val]
 
-        return placing_actions + list(flipping_actions)
+        return placing_actions + flipping_actions
 
     def is_action_terminal(self, action: int) -> bool:
         """ bool return determine whether taking said action would end the game.
@@ -199,33 +205,30 @@ class Patterns:
         if action >= 104:
             return False
 
+        # the location being flipped and the orthogonal neighbors:
         removed_location = location_to_coordinates[action % 52]
+        removed_orthogonal = orthogonal_neighbors[removed_location]
         set_removed_location = set(removed_location)
         color = self.active_bowl_token if action < 52 else self.active_board[removed_location]
 
-        # Placing moves, flipping moves of same color, flipping moves of different colors:
-        placing_locations = self.passive_placing_groups[self.passive_bowl_token]
-
-        # unless there are no more placing moves allowed:
         if self.is_no_more_placing:
             placing_locations = set()
 
-        same_color_flipping_locations = self.passive_flipping_groups[color]
+        else:
+            # Placing moves, flipping moves of same color, flipping moves of different colors:
+            if self.passive_color_order[self.passive_bowl_token] == 0:
+                placing_locations = (set(location_to_coordinates) - self.flipped_locations
+                                     - self.active_orthogonal_groups[self.passive_bowl_token]
+                                     - set_removed_location)
 
-        different_color_flipping_locations = set(location_to_coordinates[_loc - 52] for _loc in self.passive_flipping_actions)
-        different_color_flipping_locations -= same_color_flipping_locations
+            else:
+                placing_locations = (self.passive_orthogonal_groups[self.passive_bowl_token]
+                                     - self.active_orthogonal_groups[self.passive_bowl_token]
+                                     - set_removed_location)
 
-        # now determine how many of these are killed by the current action:
-        removed_orthogonal = orthogonal_neighbors[removed_location]
-
-        # take the removed location from each of the sets:
-        placing_locations -= set_removed_location
-        different_color_flipping_locations -= set_removed_location
-        same_color_flipping_locations -= set_removed_location
-
-        # remove the orthogonals of the location from the same color flipping moves and the placing moves IF
-        # they share a color only:
-        same_color_flipping_locations -= removed_orthogonal
+        same_color_flipping_locations = self.passive_flipping_groups[color] - set_removed_location - removed_orthogonal
+        different_color_flipping_locations = set([_coord for _key, _val in self.passive_flipping_groups.items()
+                                                  for _coord in _val if _key != color]) - set_removed_location
 
         if color == self.passive_bowl_token:
             placing_locations -= removed_orthogonal
@@ -248,9 +251,8 @@ class Patterns:
         self.active_color_groups, self.passive_color_groups = self.passive_color_groups, self.active_color_groups
         self.active_board, self.passive_board = self.passive_board, self.active_board
         self.active_color_order, self.passive_color_order = self.passive_color_order, self.active_color_order
-        self.active_placing_groups, self.passive_placing_groups = self.passive_placing_groups, self.active_placing_groups
+        self.active_orthogonal_groups, self.passive_orthogonal_groups = self.passive_orthogonal_groups, self.active_orthogonal_groups
         self.active_flipping_groups, self.passive_flipping_groups = self.passive_flipping_groups, self.active_flipping_groups
-        self.active_flipping_actions, self.passive_flipping_actions = self.passive_flipping_actions, self.active_flipping_actions
 
     def step(self, action: int) -> tuple[bool, Optional[int]]:
         """ progress the state according to the action
@@ -299,9 +301,6 @@ class Patterns:
             # if the game is terminal, take all remaining flips for any player with flips left to take:
             self.take_all_flips()
 
-            # clean up the remaining actions to represent a terminal state with no possible actions:
-            self.delete_possible_actions()
-
             # Calculate the score:
             active_score, passive_score = self.calculate_score()
             result = 0 if active_score == passive_score else 1 if active_score > passive_score else -1
@@ -346,52 +345,33 @@ class Patterns:
 
         for _col in range(6):
             self.active_flipping_groups[_col] -= coords_set
-            self.active_placing_groups[_col] -= coords_set
+            self.active_orthogonal_groups[_col] -= coords_set
             self.passive_flipping_groups[_col] -= coords_set
-            self.passive_placing_groups[_col] -= coords_set
+            self.passive_orthogonal_groups[_col] -= coords_set
 
     def update_color_groups(self, coords: tuple[int, int], color: int) -> None:
         # If the token is the first in the color group, update order taken and create initial (empty) placing group:
         if len(self.active_color_groups[color]) == 0:
             self.active_color_order[color] = self.active_placing_number
             self.active_placing_number += 1
-            self.active_placing_groups[color] = set()
 
         # Add the newly placed token to the relevant color group:
         self.active_color_groups[color].append(coords)
 
     def update_placing_and_flipping_groups(self, coords: tuple[int, int], color: int) -> None:
-        # empty token orthogonals:
+        """ placing groups should contain the coordinates where the correct color bowl token could be placed,
+        orthogonal to the existing group and NOT orthogonal to the opponent groups.
+        """
+        # add empty token orthogonals to the active orthogonal color group:
         token_orthogonals = orthogonal_neighbors[coords] - self.flipped_locations
+        self.active_orthogonal_groups[color] |= token_orthogonals
 
-        # detect spots that exist in both the passive and active placing groups:
-        if self.passive_color_order[color] == 0:
-            mutually_orthogonal = set()
+        # iterate over the flipping groups for the given color for both passive and active players:
+        self.active_flipping_groups[color] = set([_x for _x in self.active_orthogonal_groups[color]
+                                                  if _x not in self.passive_orthogonal_groups[color]])
 
-        else:
-            mutually_orthogonal = self.passive_placing_groups[color] & token_orthogonals
-
-        # Remove the mutual orthogonals from both the passive and the active placing groups:
-        self.passive_placing_groups[color] -= mutually_orthogonal
-        self.passive_flipping_groups[color] -= mutually_orthogonal
-        legal_places = token_orthogonals - mutually_orthogonal
-
-        # Remove anything that doesn't match color for the active flipping group:
-        legal_flips = set([_lp for _lp in legal_places if self.active_board[_lp] == color])
-
-        # add the empty and legal places to the active placing groups:
-        self.active_placing_groups[color] |= legal_places
-
-        # add the empty, legal and matching spaces to the flipping groups:
-        self.active_flipping_groups[color] |= legal_flips
-
-        # Remove the new location action represented by the coordinates:
-        self.active_flipping_actions -= {coordinates_to_location[coords] + 52}
-        self.passive_flipping_actions -= {coordinates_to_location[coords] + 52}
-
-        # add the new flips enabled by the new location:
-        self.active_flipping_actions |= set([coordinates_to_location[_coord] + 52 for
-                                             _coord in legal_flips])
+        self.passive_flipping_groups[color] = set([_x for _x in self.passive_orthogonal_groups[color]
+                                                   if _x not in self.active_orthogonal_groups[color]])
 
     def take_all_flips(self) -> None:
         """ It has been determined that the passive player will have no moves remaining. Take all
@@ -404,13 +384,3 @@ class Patterns:
                     self.active_board[_location] += 6
                     self.passive_board[_location] += 12
                     self.active_color_groups[_col].append(_location)
-
-    def delete_possible_actions(self) -> None:
-        """ after the flips have been taken, remove the actions still represented in the action
-        space
-        """
-        self.is_no_more_placing = True
-        self.active_placing_groups = {_col: set() for _col in range(6)}
-        self.passive_placing_groups = {_col: set() for _col in range(6)}
-        self.active_flipping_actions = set()
-        self.passive_flipping_actions = set()

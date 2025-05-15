@@ -8,6 +8,7 @@ from typing import Optional, Self
 import torch
 
 from game import Patterns
+from plotting import PatternPlotter
 from int_to_board import location_to_coordinates, loci, locj
 
 
@@ -64,16 +65,17 @@ class Node:
         self.child_visit_counts = np.ones(arr_size, dtype=int)
         self.create_tensor_state()
 
-        print("we have a game")
         if self.full_policy is not None:
-            self.policy_vector = self.numpy_softmax(self.full_policy[self.possible_actions])
+            if not self.possible_actions:
+                pplotter_parent = PatternPlotter(self.parent.game)
+                pplotter = PatternPlotter(self.game)
+                pplotter_parent.plot(fig_size=(7, 5))
+                pplotter.plot(fig_size=(7, 5))
+                print(self.parent.game.is_action_terminal(self.parent.possible_actions[self.parent_action_arg]))
+                print(self.game.is_terminal)
+                print(self.parent.game.is_no_more_placing)
 
-    @staticmethod
-    def numpy_softmax(logits: np.ndarray[float]) -> np.ndarray[float]:
-        """ numpy implementation given the slowness of torch tensors for allocation
-        """
-        exp_demaxed_logits = np.exp(logits - np.max(logits))
-        return exp_demaxed_logits / exp_demaxed_logits.sum()
+            self.policy_vector = self.numpy_softmax(self.full_policy[self.possible_actions])
 
     def calculate_reward(self) -> float:
         """ The REWARD for this node. Note this is not equivalent to result.
@@ -94,12 +96,24 @@ class Node:
     def calculate_child_exploration_scores(self) -> np.ndarray[float]:
         """ the exploration scores for a single node, a variation on puct scores:
         """
-        if self.full_policy is not None and self.policy_vector is None:
-            print("error")
-
-        print(self.policy_vector, self.full_policy, self.visit_count, self.game)
-
         return self.policy_vector * (self.visit_count ** 0.5) / self.child_visit_counts
+
+    def assign_policy(self, full_policy: np.ndarray) -> None:
+        """ if this node already has a game, restrict the policy to the relevant
+        vector, else store the full policy.
+        """
+        if self.game is not None:
+            self.policy_vector = self.numpy_softmax(full_policy[self.possible_actions])
+
+        else:
+            self.full_policy = full_policy
+
+    @staticmethod
+    def numpy_softmax(logits: np.ndarray[float]) -> np.ndarray[float]:
+        """ numpy implementation given the slowness of torch tensors for allocation
+        """
+        exp_demaxed_logits = np.exp(logits - np.max(logits))
+        return exp_demaxed_logits / exp_demaxed_logits.sum()
 
     def expand(self) -> Self:
         """ expand this node by creating and assigning child nodes:
