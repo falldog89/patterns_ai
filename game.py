@@ -45,6 +45,10 @@ class Patterns:
         self.action_space = (107,)
         self.state_space = (66,)
 
+        if clone_game is not None:
+            self.clone(clone_game)
+            return
+
         # track the board as well, as this will be used in the NN implementation:
         self.active_board = np.zeros((8, 8), dtype=int)
         self.passive_board = np.zeros((8, 8), dtype=int)
@@ -58,8 +62,8 @@ class Patterns:
         self.is_terminal = False
         self.result: Optional[int] = None
 
-        # The active player can be 1 or -1:
-        self.player = 1
+        # The active player, that is the player about to make a move, can be 1 or -1:
+        self.active_player = 1
 
         # track locations that have been permanently claimed by a player:
         self.flipped_locations = set()
@@ -83,66 +87,52 @@ class Patterns:
         self.passive_flipping_groups = {_col: set() for _col in range(6)}
 
         # and store and update all possible flipping moves, not keyed by color:
-        self.active_flipping_actions= set()
+        self.active_flipping_actions = set()
         self.passive_flipping_actions = set()
 
         # Track the next color-group order token to be placed:
         self.active_placing_number, self.passive_placing_number = 1, 1
-
-        if clone_game is not None:
-            self.clone(clone_game)
-
-        else:
-            self.initialize_boards() # populate an initial random state:
+        self.initialize_boards() # populate an initial random state:
 
     def clone(self, patterns_game: Self) -> None:
         """ populate this game with an identical copy:
+        Make sure deep not shallow copy:
         """
-        # track the board as well, as this will be used in the NN implementation:
-        self.active_board = patterns_game.active_board
-        self.passive_board = patterns_game.passive_board
-        self.active_color_order = patterns_game.active_color_order
-        self.passive_color_order = patterns_game.passive_color_order
+        # Copy numpy arrays:
+        self.active_board = np.array(patterns_game.active_board)
+        self.passive_board = np.array(patterns_game.passive_board)
 
-        # setting the initial game state for first couple of turns:
+        # slice copy lists:
+        self.active_color_order = patterns_game.active_color_order[:]
+        self.passive_color_order = patterns_game.passive_color_order[:]
+
+        # single numbers: no need to copy:
         self.turn_number = patterns_game.turn_number
         self.is_game_started = patterns_game.is_game_started
         self.first_turn_passed = patterns_game.first_turn_passed
         self.is_terminal = patterns_game.is_terminal
         self.result = patterns_game.result
-
-        # The active player can be 1 or -1:
-        self.player = patterns_game.player
-
-        # track locations that have been permanently claimed by a player:
-        self.flipped_locations = patterns_game.flipped_locations
-
-        # Once this flag is True, no more placing actions are allowed for either player:
+        self.active_player = patterns_game.active_player
         self.is_no_more_placing = patterns_game.is_no_more_placing
-
-        # active and passive bowl tokens:
         self.active_bowl_token = patterns_game.active_bowl_token
         self.passive_bowl_token = patterns_game.passive_bowl_token
-
-        # dictionary of colour: list[(int, int) locations]
-        self.active_color_groups = patterns_game.active_color_groups
-        self.passive_color_groups = patterns_game.passive_color_groups
-
-        # store dictionary of color: potential locations for placing:
-        self.active_placing_groups = patterns_game.active_placing_groups
-        self.passive_placing_groups = patterns_game.passive_placing_groups
-
-        # likewise store dictionary of color: potential flips:
-        self.active_flipping_groups = patterns_game.active_flipping_groups
-        self.passive_flipping_groups = patterns_game.passive_flipping_groups
-
-        # and store and update all possible flipping moves, not keyed by color:
-        self.active_flipping_actions = patterns_game.active_flipping_actions
-        self.passive_flipping_actions = patterns_game.passive_flipping_actions
-
-        # Track the next color-group order token to be placed:
         self.active_placing_number = patterns_game.active_placing_number
         self.passive_placing_number = patterns_game.passive_placing_number
+
+        # set copy:
+        self.flipped_locations = set(patterns_game.flipped_locations)
+        self.active_flipping_actions = set(patterns_game.active_flipping_actions)
+        self.passive_flipping_actions = set(patterns_game.passive_flipping_actions)
+
+        # dictionary copy: must deep copy by explicitly setting lists within
+        self.active_color_groups = {_col: _val[:] for _col, _val in patterns_game.active_color_groups.items()}
+        self.passive_color_groups = {_col: _val[:] for _col, _val in patterns_game.passive_color_groups.items()}
+
+        self.active_placing_groups = {_col: set(_val) for _col, _val in patterns_game.active_placing_groups.items()}
+        self.passive_placing_groups = {_col: set(_val) for _col, _val in patterns_game.passive_placing_groups.items()}
+
+        self.active_flipping_groups = {_col: set(_val) for _col, _val in patterns_game.active_flipping_groups.items()}
+        self.passive_flipping_groups = {_col: set(_val) for _col, _val in patterns_game.passive_placing_groups.items()}
 
     def initialize_boards(self):
         """ create an initial random assortment of colours, missing 1, 2 in the middle:
@@ -201,11 +191,56 @@ class Patterns:
 
         return placing_actions + list(flipping_actions)
 
+    def is_action_terminal(self, action: int) -> bool:
+        """ bool return determine whether taking said action would end the game.
+
+        It will end the game if, as a result of the action, the next player will not be able to take a move.
+        """
+        if action >= 104:
+            return False
+
+        removed_location = location_to_coordinates[action % 52]
+        set_removed_location = set(removed_location)
+        color = self.active_bowl_token if action < 52 else self.active_board[removed_location]
+
+        # Placing moves, flipping moves of same color, flipping moves of different colors:
+        placing_locations = self.passive_placing_groups[self.passive_bowl_token]
+
+        # unless there are no more placing moves allowed:
+        if self.is_no_more_placing:
+            placing_locations = set()
+
+        same_color_flipping_locations = self.passive_flipping_groups[color]
+
+        different_color_flipping_locations = set(location_to_coordinates[_loc - 52] for _loc in self.passive_flipping_actions)
+        different_color_flipping_locations -= same_color_flipping_locations
+
+        # now determine how many of these are killed by the current action:
+        removed_orthogonal = orthogonal_neighbors[removed_location]
+
+        # take the removed location from each of the sets:
+        placing_locations -= set_removed_location
+        different_color_flipping_locations -= set_removed_location
+        same_color_flipping_locations -= set_removed_location
+
+        # remove the orthogonals of the location from the same color flipping moves and the placing moves IF
+        # they share a color only:
+        same_color_flipping_locations -= removed_orthogonal
+
+        if color == self.passive_bowl_token:
+            placing_locations -= removed_orthogonal
+
+        # if there will be a single move remaining, the game is not terminal:
+        if len(placing_locations) + len(same_color_flipping_locations) + len(different_color_flipping_locations) > 0:
+            return False
+
+        return True
+
     def swap_players(self) -> None:
         """ swap the player and update all the pointers to the correct attributes
         """
         self.turn_number += 1
-        self.player *= -1
+        self.active_player *= -1
 
         # switch active and passive:
         self.active_bowl_token, self.passive_bowl_token = self.passive_bowl_token, self.active_bowl_token
@@ -220,6 +255,7 @@ class Patterns:
     def step(self, action: int) -> tuple[bool, Optional[int]]:
         """ progress the state according to the action
         """
+        is_game_terminal = self.is_action_terminal(action)
 
         # Simply pass choice of initial bowl token to the other player:
         if action == 106:
@@ -246,31 +282,35 @@ class Patterns:
             location = action % 52
             coords = loci[location], locj[location]
 
+            # active bowl token -> token picked up (not flipped)
+            # active board location -> active bowl token
+            # passive board location -> active bowl token, as these will be added on to in update_locations()
             if action < 52:
-                self.active_bowl_token, self.active_board[coords], self.passive_board[coords] = (self.active_board[coords],
-                                                                                                 self.active_bowl_token,
-                                                                                                 self.active_bowl_token)
+                (self.active_bowl_token,
+                 self.active_board[coords],
+                 self.passive_board[coords]) = (self.active_board[coords],
+                                                self.active_bowl_token,
+                                                self.active_bowl_token)
 
             # function to update the various orthogonals and valid moves attributes:
             self.update_locations(coords)
 
-        # if there are no flips and either no more placing actions OR placing actions have stopped:
-        if len(self.passive_flipping_actions) == 0:
-            if (len(self.passive_placing_groups[self.passive_bowl_token]) == 0) or self.is_no_more_placing:
-                self.take_all_flips()
-                p1_score, p2_score = self.calculate_score()
-                result = 0
+        if is_game_terminal:
+            # if the game is terminal, take all remaining flips for any player with flips left to take:
+            self.take_all_flips()
 
-                if p1_score > p2_score:
-                    result = 1
+            # clean up the remaining actions to represent a terminal state with no possible actions:
+            self.delete_possible_actions()
 
-                if p1_score < p2_score:
-                    result = -1
+            # Calculate the score:
+            active_score, passive_score = self.calculate_score()
+            result = 0 if active_score == passive_score else 1 if active_score > passive_score else -1
 
-                self.is_terminal = True
-                self.result = result
+            # store the result
+            self.is_terminal = True
+            self.result = result
 
-                return True, result
+            return True, result
 
         # swap the player attributes:
         self.swap_players()
@@ -358,7 +398,19 @@ class Patterns:
         remaining flipping moves as the active player now and end the game.
         """
         for _col in range(6):
-            for _location in self.active_flipping_groups[_col]:
-                self.active_board[_location] += 6
-                self.passive_board[_location] += 12
-                self.active_color_groups[_col].append(_location)
+            # only take this step if you have already started a color group:
+            if self.active_color_groups[_col]:
+                for _location in self.active_flipping_groups[_col]:
+                    self.active_board[_location] += 6
+                    self.passive_board[_location] += 12
+                    self.active_color_groups[_col].append(_location)
+
+    def delete_possible_actions(self) -> None:
+        """ after the flips have been taken, remove the actions still represented in the action
+        space
+        """
+        self.is_no_more_placing = True
+        self.active_placing_groups = {_col: set() for _col in range(6)}
+        self.passive_placing_groups = {_col: set() for _col in range(6)}
+        self.active_flipping_actions = set()
+        self.passive_flipping_actions = set()

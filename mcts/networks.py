@@ -52,7 +52,7 @@ class PatternsNet(nn.Module):
         self.twoheadlayer = TwoHeadNet(in_channels=out_channels,
                                        value_out_channels=out_channels // 16,
                                        policy_out_channels=out_channels // 4,
-                                       action_space=(106,))
+                                       action_space=(107,))
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """ pass the input through the initial conv layer, expanding input channels to the number
@@ -74,7 +74,7 @@ class TwoHeadNet(nn.Module):
                  in_channels: int,
                  value_out_channels: int,
                  policy_out_channels: int,
-                 action_space: tuple = (106,)) -> None:
+                 action_space: tuple = (107,)) -> None:
         super(TwoHeadNet, self).__init__()
         self.action_space = action_space
 

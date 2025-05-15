@@ -93,8 +93,20 @@ class PatternPlotter:
                   )
 
     def add_bowls(self, axis: plt.axis) -> None:
-        """ draw the bowls for bowl tokens, and add those tokens if they have been chosen:
+        """ draw the bowls for bowl tokens, and add those tokens if they have been chosen.
+        Further, highlight the active players bowl with a golden outline:
         """
+        # highlioht active player bowl, that is the player who will be playing next:
+        active_center = self.bowl_centers[0] if self.game.active_player == 1 else self.bowl_centers[1]
+        axis.add_patch(
+            patches.Circle(
+                active_center,
+                radius=2.2,
+                alpha=0.4,
+                facecolor=(1.0, 0.8, 0)
+            )
+        )
+
         # draw the bowl:
         axis.add_patch(
             patches.Circle(self.bowl_centers[0],
@@ -111,8 +123,8 @@ class PatternPlotter:
         )
 
         # assign the hand pieces to each player:
-        p1_hand = self.game.active_bowl_token if self.game.player == 0 else self.game.passive_bowl_token
-        p2_hand = self.game.active_bowl_token if self.game.player == 1 else self.game.passive_bowl_token
+        p1_hand = self.game.active_bowl_token if self.game.active_player == 1 else self.game.passive_bowl_token
+        p2_hand = self.game.active_bowl_token if self.game.active_player == -1 else self.game.passive_bowl_token
 
         # display the hand pieces for each player:
         if p1_hand is not None:
@@ -173,7 +185,7 @@ class PatternPlotter:
         """ draw all the tokens, flipped or unflipped, on the board
         """
         # keep consistency by pointing at the relevant state vector:
-        board = self.game.active_board if self.game.player == 0 else self.game.passive_board
+        board = self.game.active_board if self.game.active_player == 1 else self.game.passive_board
 
         for _location in location_to_coordinates:
             _color = board[_location]
@@ -193,13 +205,13 @@ class PatternPlotter:
         the color groups were taken
         """
         # assign the color-order-taken to each player:
-        p1_order = self.game.active_color_order if self.game.player == 0 else self.game.passive_color_order
-        p2_order = self.game.active_color_order if self.game.player == 1 else self.game.passive_color_order
+        p1_order = self.game.active_color_order if self.game.active_player == 1 else self.game.passive_color_order
+        p2_order = self.game.active_color_order if self.game.active_player == -1 else self.game.passive_color_order
         player_orders = [p1_order, p2_order]
 
         # assign the color groups to each player:
-        p1_color_groups = self.game.active_color_groups if self.game.player == 0 else self.game.passive_color_groups
-        p2_color_groups = self.game.active_color_groups if self.game.player == 1 else self.game.passive_color_groups
+        p1_color_groups = self.game.active_color_groups if self.game.active_player == 1 else self.game.passive_color_groups
+        p2_color_groups = self.game.active_color_groups if self.game.active_player == -1 else self.game.passive_color_groups
         player_color_groups = [p1_color_groups, p2_color_groups]
 
         token_points = [8, 4]
@@ -207,8 +219,8 @@ class PatternPlotter:
         face_colors = [(0.8, 0.1, 0.8), (0.8, 0.8, 0.9)]
 
         for porder, pcgroup, tstart, npoints, fcol, yoff in zip(player_orders, player_color_groups,
-                                                          self.token_starts, token_points,
-                                                          face_colors, y_offsets):
+                                                                self.token_starts, token_points,
+                                                                face_colors, y_offsets):
             # populate the ordering tiles for each player, from 1-6:
             untaken = 5
 
@@ -244,7 +256,7 @@ class PatternPlotter:
                           horizontalalignment='center',
                           verticalalignment='center', )
 
-    def populate_board(self) -> None:
+    def plot(self) -> None:
         """ plot the board according to the state:
 
         plot the player 1 and player 2 hand tiles somewhere for ease, as well as the colours they have taken so far!
