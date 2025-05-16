@@ -127,7 +127,7 @@ class Patterns:
         self.passive_orthogonal_groups = {_col: set(_val) for _col, _val in patterns_game.passive_orthogonal_groups.items()}
 
         self.active_flipping_groups = {_col: set(_val) for _col, _val in patterns_game.active_flipping_groups.items()}
-        self.passive_flipping_groups = {_col: set(_val) for _col, _val in patterns_game.passive_placing_groups.items()}
+        self.passive_flipping_groups = {_col: set(_val) for _col, _val in patterns_game.passive_flipping_groups.items()}
 
     def initialize_boards(self):
         """ create an initial random assortment of colours, missing 1, 2 in the middle:
@@ -208,7 +208,7 @@ class Patterns:
         # the location being flipped and the orthogonal neighbors:
         removed_location = location_to_coordinates[action % 52]
         removed_orthogonal = orthogonal_neighbors[removed_location]
-        set_removed_location = set(removed_location)
+        set_removed_location = {removed_location}
         color = self.active_bowl_token if action < 52 else self.active_board[removed_location]
 
         if self.is_no_more_placing:
@@ -298,8 +298,16 @@ class Patterns:
             self.update_locations(coords)
 
         if is_game_terminal:
-            # if the game is terminal, take all remaining flips for any player with flips left to take:
-            self.take_all_flips()
+            # just being sure nothing slips through the cracks, but I believe it should not be possible to arrive
+            # here without this flag set...
+            self.is_no_more_placing = True
+
+            # take actions until the game ends, without swapping players:
+            actions = self.get_actions()
+
+            while actions:
+                self.step(actions[0])
+                actions = self.get_actions()
 
             # Calculate the score:
             active_score, passive_score = self.calculate_score()
@@ -368,19 +376,9 @@ class Patterns:
 
         # iterate over the flipping groups for the given color for both passive and active players:
         self.active_flipping_groups[color] = set([_x for _x in self.active_orthogonal_groups[color]
+                                                  if self.active_board[_x] == color
                                                   if _x not in self.passive_orthogonal_groups[color]])
 
         self.passive_flipping_groups[color] = set([_x for _x in self.passive_orthogonal_groups[color]
+                                                   if self.active_board[_x] == color
                                                    if _x not in self.active_orthogonal_groups[color]])
-
-    def take_all_flips(self) -> None:
-        """ It has been determined that the passive player will have no moves remaining. Take all
-        remaining flipping moves as the active player now and end the game.
-        """
-        for _col in range(6):
-            # only take this step if you have already started a color group:
-            if self.active_color_groups[_col]:
-                for _location in self.active_flipping_groups[_col]:
-                    self.active_board[_location] += 6
-                    self.passive_board[_location] += 12
-                    self.active_color_groups[_col].append(_location)

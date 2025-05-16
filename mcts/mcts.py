@@ -1,4 +1,25 @@
 """ search tree code following MCTS algortithm, adapted to patterns
+
+Extension 1.
+There is a desire to create trees that search deeper rather than wider, at least while training.
+It is only by looking deeper that a reasonable signal can be found to suggest how good, or bad, a state is.
+
+Therefore the breadth is artificially limited in exploration, so that only the top N positions are considered,
+along with a further M random positions. Say 5 + 5, which restricts the breadth significantly.
+
+Extension 2.
+At the beginning of the learning process, when the network has not yet understood what
+is or is not a good position, the games can be played randomly. As more understanding is built up, and the network
+is better, the games should be played progressively less randomly. In this way, we reduce time spent on inference
+results before they are useful.
+
+Extension 3.
+We can look at all the perturbations of a given state during training, exploiting the symmetries (D4?) and
+the permutations of colors.
+
+Extension 4.
+Come up with a schedule for exploration steps that scales with depth. Ie start off with VERY few explorations,
+then do progressively more as you get deeper. Eg 10 explore, 20, 30 etc.
 """
 
 import numpy as np
@@ -8,8 +29,7 @@ from typing import Optional, Self
 import torch
 
 from game import Patterns
-from plotting import PatternPlotter
-from int_to_board import location_to_coordinates, loci, locj
+from int_to_board import loci, locj
 
 
 class Node:
@@ -20,6 +40,8 @@ class Node:
                  game: Optional[Patterns] = None,
                  parent: Optional[Self] = None,
                  depth: int = 0,
+                 breadth_restriction: Optional[int] = None,
+                 random_restriction: Optional[int] = None,
                  ) -> None:
         # Note: every node must have either a parent action argument or a game.
         self.parent_action_arg = parent_action_arg
@@ -47,6 +69,10 @@ class Node:
         self.full_policy: Optional[np.ndarray[np.double]] = None
         self.policy_vector: Optional[np.ndarray[np.double]] = None
 
+        # parameters to reduce the breadth of the search and prioritise depth instead.
+        self.breadth_restriction = breadth_restriction
+        self.random_restriction = random_restriction
+
         # if there is a game provided, this will populate the relevant attributes:
         self.populate_attributes()
 
@@ -56,25 +82,50 @@ class Node:
         if not self.game:
             return
 
-        self.possible_actions = self.game.get_actions()
         self.result = self.game.result
 
-        # MCTS attributes:
+        if self.result is not None:
+            return
+
+        self.assign_actions_and_policy()
+
+        # MCTS attributes: note that possible actions already restricted above.
         arr_size = len(self.possible_actions)
         self.child_exploitation_scores = np.array([np.inf] * arr_size, dtype=float)
         self.child_visit_counts = np.ones(arr_size, dtype=int)
         self.create_tensor_state()
 
-        if self.full_policy is not None:
-            if not self.possible_actions:
-                pplotter_parent = PatternPlotter(self.parent.game)
-                pplotter = PatternPlotter(self.game)
-                pplotter_parent.plot(fig_size=(7, 5))
-                pplotter.plot(fig_size=(7, 5))
-                print(self.parent.game.is_action_terminal(self.parent.possible_actions[self.parent_action_arg]))
-                print(self.game.is_terminal)
-                print(self.parent.game.is_no_more_placing)
+    def assign_actions_and_policy(self) -> None:
+        """ check whether the full policy is assigned yet, if it is, restrict to legal actions,
+        and if there are breadth restrictions in place, restrict the action space
+        """
+        self.possible_actions = self.game.get_actions()
 
+        # if the full policy has been assigned.
+        if self.full_policy is not None:
+            # restrict the full policy to legal actions, arg sort.
+            restricted_policy = self.full_policy[self.possible_actions]
+
+            # if the search space is already suitably restrictive, do nothing:
+            if len(self.possible_actions) <= (self.breadth_restriction + self.random_restriction):
+                self.policy_vector = self.numpy_softmax(restricted_policy)
+                return
+
+            # sort actions according to the policy prior:
+            prior_sorted_actions = np.argsort(restricted_policy)
+
+            # select the top n best, according to the breadth restriction:
+            topn_actions = prior_sorted_actions[:self.breadth_restriction]
+
+            # supplement with up to m random additional actions
+            remaining_actions = prior_sorted_actions[self.breadth_restriction:]
+            np.random.shuffle(remaining_actions)
+            random_actions = remaining_actions[:self.random_restriction]
+
+            # assign new actions as though these were the only legal ones from this position:
+            self.possible_actions = topn_actions + random_actions
+
+            # first restrict policy vector to the *legal actions*:
             self.policy_vector = self.numpy_softmax(self.full_policy[self.possible_actions])
 
     def calculate_reward(self) -> float:
@@ -134,6 +185,9 @@ class Node:
 
             # now that the game exists, the attributes can be populated:
             self.populate_attributes()
+
+            if self.result is not None:
+                return self
 
         # Games are populated only with a parent action argument and a parent to minimize copy time:
         for _it, _move in enumerate(self.possible_actions):
@@ -304,6 +358,11 @@ class Tree:
 
         Noise is only used when the tree is in training mode. Agents should not use noise
         when playing optimally
+
+        "The ϵ parameter for the Dirichlet noise is set to 0.25 and the α parameter to 0.03,
+         which is consistent with the heuristic of using a = 10 / n with n the
+         maximum number of possibles moves, which is 19 × 19 + 1 = 362
+          in the case of Go."
         """
         if self._noise is None:
             self.set_noise()

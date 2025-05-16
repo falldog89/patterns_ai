@@ -117,7 +117,7 @@ class Agent:
             # flow to current leaf following argmax of puct scores:
             leaf_node = _tree.get_leaf_node()
 
-            print(_it)
+            # print(_it)
             # leaf node is unchanged if terminal or first visit, else random child:
             leaf_node = leaf_node.expand()
 
@@ -137,13 +137,13 @@ class Agent:
         # size is (num_trees, 102, 8 8)
         tensor_stack = torch.stack(tensor_states)
 
-        # # two head inference results:
-        # with torch.inference_mode():
-        #     value_stack, policy_stack = self.network(tensor_stack.float().to(self.device, non_blocking=True))
+        # two head inference results:
+        with torch.inference_mode():
+            value_stack, policy_stack = self.network(tensor_stack.float().to(self.device, non_blocking=True))
 
-        # test just on cpu for now:
-        value_stack = -1. + 2. * torch.rand((tensor_stack.shape[0]))
-        policy_stack = torch.rand((tensor_stack.shape[0], 107))
+        # # test just on cpu for now:
+        # value_stack = -1. + 2. * torch.rand((tensor_stack.shape[0]))
+        # policy_stack = torch.rand((tensor_stack.shape[0], 107))
 
         value_stack = value_stack.to("cpu", non_blocking=True).numpy()
         policy_stack = policy_stack.to("cpu", non_blocking=True).numpy()
