@@ -1,11 +1,13 @@
-""" search tree code following MCTS algortithm, adapted to patterns
+""" search tree code following MCTS algortithm, adapted to patterns.
 
-Extension 1.
-There is a desire to create trees that search deeper rather than wider, at least while training.
-It is only by looking deeper that a reasonable signal can be found to suggest how good, or bad, a state is.
-
-Therefore the breadth is artificially limited in exploration, so that only the top N positions are considered,
-along with a further M random positions. Say 5 + 5, which restricts the breadth significantly.
+Extensions:
+1. Option for random play
+2. action space restricted to promote depth over breadth
+    - what about missing the terminal states... we could have a " is action terminal" checked
+        for each action in the action space, and ensure that is collected?
+3. Schedules for these.
+4. Schedules for exploration steps to spend the biccies deeper rather than early on, until the network
+    is learning something...
 
 Extension 2.
 At the beginning of the learning process, when the network has not yet understood what
@@ -13,13 +15,32 @@ is or is not a good position, the games can be played randomly. As more understa
 is better, the games should be played progressively less randomly. In this way, we reduce time spent on inference
 results before they are useful.
 
-Extension 3.
-We can look at all the perturbations of a given state during training, exploiting the symmetries (D4?) and
-the permutations of colors.
+This requires two things to work
+1. we must make sure that NONE of the nodes are exploring with tensor, as this will remove the batching speed up
+    - one approach here, given there is no speed up associated with random play, is to assign the random policy
+        without switching back to the agent?
+
+3. first session has random play anyway
+4. still need to assign random tensor to still restrict the exploration...
 
 Extension 4.
 Come up with a schedule for exploration steps that scales with depth. Ie start off with VERY few explorations,
 then do progressively more as you get deeper. Eg 10 explore, 20, 30 etc.
+
+Okay so todo is:
+2. random play
+    For random play, we want to
+        avoid creating a tensor
+        avoid evaluation
+        STILL respect the restriction of the action space
+        assign a random full_policy and value?
+        NOT do all the exploring
+            we don't want to train from the random data
+            we don't want to spend resources playing like that
+
+            So I think we want to use random play with single look ahead. That is, scan for a terminal in one,
+            choose the best.
+3. schedule for exploration steps
 """
 
 import numpy as np
@@ -33,7 +54,8 @@ from int_to_board import loci, locj
 
 
 class Node:
-    """ search tree node for patterns:
+    """ search tree node for patterns. Root node is populated with full policy and a game so that it can
+    populate the attributes correctly on first expansion.
     """
     def __init__(self,
                  parent_action_arg: Optional[int] = None,
@@ -48,15 +70,24 @@ class Node:
         self.game = game
         self.parent = parent
         self.depth = depth
+
+        # parameters to reduce the breadth of the search and prioritise depth instead.
+        self.breadth_restriction = breadth_restriction
+        self.random_restriction = random_restriction
+
         self.children: list[Self] = []
         self.active_player = 1 if parent is None else -1 * parent.game.active_player
 
-        self.possible_actions: Optional = None
-        self.result: Optional = None
+        self.possible_actions: Optional[list[int]] = None
+        self.result: Optional[int] = None # trichotomy
+
+        # Flag that detects mate-in-one:
+        self.winning_action_arguments: list = []
+        self.losing_action_arguments: list = []
 
         self.child_exploitation_scores: Optional[np.ndarray] = None
         self.child_visit_counts: Optional[np.ndarray] = None
-        self.tensor_state: Optional = None
+        self.tensor_state: Optional[torch.tensor] = None
 
         # Node search results:
         self.visit_count: int = 0
@@ -69,18 +100,11 @@ class Node:
         self.full_policy: Optional[np.ndarray[np.double]] = None
         self.policy_vector: Optional[np.ndarray[np.double]] = None
 
-        # parameters to reduce the breadth of the search and prioritise depth instead.
-        self.breadth_restriction = breadth_restriction
-        self.random_restriction = random_restriction
-
-        # if there is a game provided, this will populate the relevant attributes:
-        self.populate_attributes()
-
     def populate_attributes(self) -> None:
         """ once a game is created, populate the various attributes:
         """
         if not self.game:
-            return
+            raise ValueError("You should have a game if you are populating attributes...")
 
         self.result = self.game.result
 
@@ -97,36 +121,43 @@ class Node:
 
     def assign_actions_and_policy(self) -> None:
         """ check whether the full policy is assigned yet, if it is, restrict to legal actions,
-        and if there are breadth restrictions in place, restrict the action space
+        and if there are breadth restrictions in place, restrict the action space.
         """
-        self.possible_actions = self.game.get_actions()
+        # the full policy should always have been assigned:
+        if self.full_policy is None:
+            raise ValueError(" The full policy should have been assigned before these attributes "
+                             "are assigned")
 
-        # if the full policy has been assigned.
-        if self.full_policy is not None:
-            # restrict the full policy to legal actions, arg sort.
-            restricted_policy = self.full_policy[self.possible_actions]
+        game_actions = self.game.get_actions()
 
-            # if the search space is already suitably restrictive, do nothing:
-            if len(self.possible_actions) <= (self.breadth_restriction + self.random_restriction):
-                self.policy_vector = self.numpy_softmax(restricted_policy)
-                return
+        # determine which actions are terminal: do NOT curtail an action that is terminal, as these HAVE to be
+        # explorable every time!
+        terminal_actions = [_action for _action in game_actions if self.game.is_action_terminal(_action)]
 
-            # sort actions according to the policy prior:
-            prior_sorted_actions = np.argsort(restricted_policy)
+        # restrict the full policy to legal actions, arg sort.
+        restricted_policy = self.full_policy[game_actions]
 
-            # select the top n best, according to the breadth restriction:
-            topn_actions = prior_sorted_actions[:self.breadth_restriction]
+        # if the search space is already suitably restrictive, do nothing:
+        if len(game_actions) <= (self.breadth_restriction + self.random_restriction):
+            self.policy_vector = self.numpy_softmax(restricted_policy)
+            self.possible_actions = game_actions
+            return
 
-            # supplement with up to m random additional actions
-            remaining_actions = prior_sorted_actions[self.breadth_restriction:]
-            np.random.shuffle(remaining_actions)
-            random_actions = remaining_actions[:self.random_restriction]
+        # sort actions according to the policy prior:
+        sorted_arguments = np.argsort(restricted_policy)
 
-            # assign new actions as though these were the only legal ones from this position:
-            self.possible_actions = topn_actions + random_actions
+        # select the top n best, according to the breadth restriction:
+        topn_actions = [game_actions[_arg] for _arg in sorted_arguments[:self.breadth_restriction]]
 
-            # first restrict policy vector to the *legal actions*:
-            self.policy_vector = self.numpy_softmax(self.full_policy[self.possible_actions])
+        remaining_args = sorted_arguments[self.breadth_restriction:]
+        random.shuffle(remaining_args)
+        random_actions = [game_actions[_arg] for _arg in remaining_args[:self.random_restriction]]
+
+        # make sure to add the terminal actions back in, no matter what!
+        self.possible_actions = list(set(topn_actions + random_actions) | set(terminal_actions))
+
+        # first restrict policy vector to the *legal actions*:
+        self.policy_vector = self.numpy_softmax(self.full_policy[self.possible_actions])
 
     def calculate_reward(self) -> float:
         """ The REWARD for this node. Note this is not equivalent to result.
@@ -142,22 +173,18 @@ class Node:
 
     def calculate_exploitation_score(self) -> float:
         """ the exploitation score of a single node, taking values between -1 and 1: """
+        # if this node is terminal and lost, return pos inf to the parent, to
+        # force repeated exploration of this mate-in-one position:
+        if self.result == -1:
+            # flip sign to represent reward to parent:
+            return np.inf
+
         return self.accrued_reward_to_parent / self.visit_count
 
     def calculate_child_exploration_scores(self) -> np.ndarray[float]:
         """ the exploration scores for a single node, a variation on puct scores:
         """
         return self.policy_vector * (self.visit_count ** 0.5) / self.child_visit_counts
-
-    def assign_policy(self, full_policy: np.ndarray) -> None:
-        """ if this node already has a game, restrict the policy to the relevant
-        vector, else store the full policy.
-        """
-        if self.game is not None:
-            self.policy_vector = self.numpy_softmax(full_policy[self.possible_actions])
-
-        else:
-            self.full_policy = full_policy
 
     @staticmethod
     def numpy_softmax(logits: np.ndarray[float]) -> np.ndarray[float]:
@@ -169,7 +196,7 @@ class Node:
     def expand(self) -> Self:
         """ expand this node by creating and assigning child nodes:
          """
-        # If the leaf state is terminal, do not expand:
+        # If the leaf state is terminal, do not expand. Note that terminal states never require a game.
         if self.result is not None:
             return self
 
@@ -183,11 +210,11 @@ class Node:
             action = self.parent.possible_actions[self.parent_action_arg]
             self.game.step(action)
 
-            # now that the game exists, the attributes can be populated:
-            self.populate_attributes()
+        self.populate_attributes()
 
-            if self.result is not None:
-                return self
+        # After game is populated, can detect terminal state and return:
+        if self.result is not None:
+            return self
 
         # Games are populated only with a parent action argument and a parent to minimize copy time:
         for _it, _move in enumerate(self.possible_actions):
@@ -195,10 +222,31 @@ class Node:
                 parent=self,
                 parent_action_arg=_it,
                 depth = self.depth + 1,
+                breadth_restriction=self.breadth_restriction,
+                random_restriction=self.random_restriction,
             )
+
+            # a win should have a positive infinite score and a loss should have a negative infinite score
+            if self.game.is_action_terminal(_move):
+                # If the game will terminate, create game to calculate score.
+                terminal_game = Patterns(self.game)
+                terminal_game.step(_move)
+
+                # set the result as would be seen IF we switched players (nodes alternate):
+                new_node.result = -terminal_game.result
+
+                # if the other player is lost after taking this step:
+                if new_node.result == -1:
+                    # store the argument, not the action itself:
+                    self.winning_action_arguments.append(_it)
+
+                # also try and avoid 1 move losses!
+                elif new_node.result == 1:
+                    self.losing_action_arguments.append(_it)
 
             self.children.append(new_node)
 
+        # return a random choice from the restricted/ legal actions:
         return random.choice(self.children)
 
     def get_state_attributes(self) -> tuple:
@@ -297,6 +345,16 @@ class Node:
 
         # and put channels first, for CNN:
         self.tensor_state = concat_tensor.permute(2, 0, 1)
+        # remove the corners:
+        self.remove_tensor_corners(self.tensor_state)
+
+    def remove_tensor_corners(self, board: torch.tensor) -> None:
+        """ one hot encoding will give class values to the corners. Remove them
+        """
+        iinds = [0] * 12
+        jinds = [0, 0, 1, 7, 6, 7, 0, 1, 0, 7, 7, 6]
+        kinds = [0, 1, 0, 7, 7, 6, 7, 7, 6, 0, 1, 0]
+        board[iinds, jinds, kinds] = 0
 
     def get_replay_state(self) -> tuple:
         """ returns everything needed to create the game state from this node, for use in the replay buffer
@@ -309,7 +367,6 @@ class Node:
                 _g.passive_bowl_token
                 )
 
-
 class Tree:
     """ Search tree functions, as most nodes will never need to access these.
     """
@@ -319,14 +376,28 @@ class Tree:
                  dirichlet_noise_level: float = 1.0,
                  dirichlet_noise_epsilon: float = 0.2,
                  puct_constant: float = 2.0 ** 0.5,
+
+                 # parameters for restricting breadth of search:
+                 breadth_restriction: Optional[int] = 4,
+                 random_restriction: Optional[int] = 4,
+
+                 # schedule for explorations steps scaling with tree depth:
+                 schedule: Optional[list[tuple]] = None,
                  ) -> None:
+
         # the game and the root node of the search tree
         if root_node is None:
             game = Patterns()
-            root_node = Node(game=game)
+            root_node = Node(
+                game=game,
+                breadth_restriction=breadth_restriction,
+                random_restriction=random_restriction
+            )
 
         self.root_node = root_node
-        self.root_node_explore_count = 0
+
+        self.breadth_restriction = breadth_restriction
+        self.random_restriction = random_restriction
 
         self.tree_id = tree_id
         # noise property only added to root node exploration:
@@ -337,17 +408,48 @@ class Tree:
         self.dirichlet_noise_level = dirichlet_noise_level
         self.dirichlet_noise_epsilon = dirichlet_noise_epsilon
 
-        self.log = None
+        # tree-level flag that dictates when a tree is done exploring and wishes to move on
+        self.is_step_ready = False
 
-    def reset(self) -> None:
+        # save the schedule to pass down to the next root nodes, use it to determine the required exploration steps
+        self.schedule = schedule
+        self.root_node_explore_count: int = 0
+        self.required_steps: int = 0
+
+        self.determine_required_steps()
+
+    def reset(self, root_node: Optional[Node] = None) -> None:
         """ take the tree back to the initial position:
         """
-        new_game = Patterns()
-        self.root_node = Node(game=new_game)
+        if not root_node:
+            new_game = Patterns()
+            root_node = Node(game=new_game)
+
+        self.root_node = root_node
         self.root_node_explore_count = 0
 
         # and reset the noise:
         self._noise = None
+
+        # set the required exploration steps again, according to the same schedule:
+        self.determine_required_steps()
+
+    def determine_required_steps(self) -> None:
+        """ use the schedule to determine how many root node explores this node should have:
+
+        Schedule always starts with (0, X) to state that there are X required steps at depth 0
+
+        Then either there is no other tuple, in which case all root nodes explore for X, or there are
+        other schedules, and as soon as your depth is below the first entry, you take the previous
+        """
+        curr_explore = self.schedule[0][1]
+        for _depth, _steps in self.schedule:
+            if self.root_node.depth < _depth:
+                break
+
+            curr_explore = _steps
+
+        self.required_steps = curr_explore
 
     @property
     def noise(self) -> np.ndarray[float]:
@@ -379,6 +481,18 @@ class Tree:
         """
         # increment the root node visit count:
         self.root_node_explore_count += 1
+
+        # if sufficient exploring:
+        if self.root_node_explore_count >= self.required_steps:
+            self.is_step_ready = True
+
+        # if mate in 1 detected:
+        if self.root_node.winning_action_arguments:
+            self.is_step_ready = True
+
+        # if this is a random player:
+        if self.required_steps == 0:
+            return self.root_node
 
         if not self.root_node.children:
             return self.root_node
@@ -418,29 +532,60 @@ class Tree:
         exploration_scores = node.calculate_child_exploration_scores()
         return node.child_exploitation_scores + self.puct_constant * exploration_scores
 
-    def determine_best_action(self, temperature: Optional[float]) -> int:
+    def choose_action_argument(self, temperature: Optional[float] = None) -> int:
         """ Sample from the child actions vector, from the distribution formed from the child visit counts:
         """
         if not self.root_node.possible_actions:
             raise ValueError("The game has no valid actions, and should have ended...")
 
+        if self.root_node.winning_action_arguments:
+            return np.random.choice(self.root_node.winning_action_arguments)
+
+        # if choosing randomly, try not to choose a loser-in-1:
+        if self.required_steps == 0:
+            if len(self.root_node.losing_action_arguments) < len(self.root_node.possible_actions):
+                # choosing arguments, not actions:
+                return random.choice(list(set(range(len(self.root_node.possible_actions)))
+                                          - set(self.root_node.losing_action_arguments)))
+
+            # if no losing actions, return a random index:
+            return random.randint(0, len(self.root_node.possible_actions) - 1)
+
+        # sample an action randomly according to visit counts:
         if temperature is not None:
             selection_scores = self.root_node.child_visit_counts ** (1.0 / temperature)
             selection_scores /= selection_scores.sum()
             return np.random.choice(range(len(selection_scores)), p=selection_scores).item()
 
+        # if no selection score, instead select the most visited child:
         return np.argmax(self.root_node.child_visit_counts).item()
 
     def step(self, action_argument: int) -> None:
-        """ Progress the tree according to the action argument """
+        """ Progress the tree according to the action argument.
+
+        We increment the visit count and create a game if there isn't one, as we never need to backprop this.
+        """
+        # create new game for new root:
+        game = Patterns(self.root_node.game)
+        action = self.root_node.possible_actions[action_argument]
+        game.step(action)
+
         # step to new root node, taking the action selected:
         self.root_node = self.root_node.children[action_argument]
+        self.root_node.game = game
+        self.root_node.visit_count += 1
 
         # reset the dirichlet noise:
         self._noise = None
 
-        # reset the root node visit count:
-        self.root_node_explore_count = 0
+        # check the schedule again after stepping:
+        self.determine_required_steps()
+        self.is_step_ready = False
+
+        # if the root node requires random moving, set the full policy to be random
+        if self.required_steps == 0:
+            self.root_node.full_policy = np.random.rand(107)
+            self.root_node.value_score = -1. + 2. * np.random.rand()
 
     @staticmethod
     def update_node_child_scores(node: Node) -> None:
@@ -455,6 +600,8 @@ class Tree:
 
         parent = node.parent
 
+        # if a child has a terminal result that gives the parent a win, the exploitation is inf.,
+        # as there is no need to explore any further.
         parent.child_exploitation_scores[node.parent_action_arg] = node.calculate_exploitation_score()
         parent.child_visit_counts[node.parent_action_arg] = node.visit_count
 
@@ -477,26 +624,39 @@ class Tree:
             # flip the sign of the reward:
             reward *= -1
 
-            self.log = (node, self.root_node)
-
-    def store_complete_game(self) -> list[tuple]:
+    def get_replay_game(self, save_depth: Optional[int]) -> tuple[list[torch.tensor], list[np.ndarray], list[int]]:
         """ Once the root node is in a terminal state, store the various states for use in the replay buffer:
-        To prevent re
+        Note that root node in a terminal state => no game! So we must first step up to parent.
+
+        save depth tells you how far from terminal state to save
         """
         result = self.root_node.result
 
         if result is None:
             raise ValueError("this function should only be called on a completed game!")
 
-        nod = self.root_node
-        full_game_backwards = [0] * self.root_node.game.turn_number
+        # start at parent, as root node is terminal and therefore has no game:
+        nod = self.root_node.parent
+
+        save_len = nod.game.turn_number if save_depth is None else save_depth
+
+        # save the tensor states, the visit counts, and the result
+        replay_tensors = [0] * save_len
+        visit_counts = [0] * save_len
+
+        # todo: weighted average of results from a given position?
+        final_results = [result] * save_len
 
         # work backwards up through the tree, storing the states and the visit counts:
-        while nod:
-            # todo: weighted average of results from a given position?
+        for _ in range(save_len - 1, -1, -1):
 
-            # save list of game states, child visit counts, and _result:
-            full_game_backwards[nod.game.turn_number - 1] = nod.game
+            # save the tensors, for training, and the final result:
+            replay_tensors[_] = nod.tensor_state
+
+            # populate full action space for the visit counts:
+            full_visit_counts = np.zeros(107, dtype=int)
+            full_visit_counts[nod.possible_actions] = nod.child_visit_counts
+            visit_counts[_] = full_visit_counts
             nod = nod.parent
 
-        return full_game_backwards
+        return replay_tensors, visit_counts, final_results

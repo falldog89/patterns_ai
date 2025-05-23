@@ -2,6 +2,7 @@
 
 
 # C:\\Users\\Danie\\PycharmProjects\\patterns\\plotting_icons\\board
+
 """
 import os
 import matplotlib.pyplot as plt
@@ -275,6 +276,60 @@ class PatternPlotter:
         ax.set_xticks([])
         ax.set_yticks([])
         plt.show()
+
+    def create_plotting_game_from_tensor_state(self, tensor_state) -> None:
+        """ just want to test and check that our augmentations of the tensor state are correct
+        """
+
+        # tensor state structure:
+        # layers 0 - 17: 8x8 patters board.
+        # 0 - 5: neutral colors
+        # 6 - 11: p1 colors
+        # 12 - 17: p2 colors
+
+        # layers 18 - 53 are p1 color order. So 18 - 23 are boolean for color 0 etc
+        # layers 54 - 89 are p2 color order.
+        # layers 90 - 101 are bowl tokens for each player
+
+        numpy_state = tensor_state.numpy()
+
+        new_game = Patterns()
+
+        for _ in range(90, 95):
+            if numpy_state[_, 0, 0] == 1:
+                new_game.active_bowl_token = _ - 90
+                break
+
+        for _ in range(96, 101):
+            if numpy_state[_, 0, 0] == 1:
+                new_game.passive_bowl_token = _ - 96
+                break
+
+        # populate the board:
+        new_game.active_board = np.zeros((8, 8), dtype=int)
+        vals, iind, jind = np.where(numpy_state[:18])
+        new_game.active_board[iind, jind] = vals
+
+        # populate the color orders:
+        for _ in range(18, 54):
+            if numpy_state[_, 0, 0] == 1:
+                color = (_ // 6) - 3
+                new_game.active_color_order[color] = (_ % 6) + 1
+
+                loci, locj = np.where(new_game.active_board == color + 6)
+                new_game.active_color_groups[color].append((loci[0], locj[0]))
+
+        for _ in range(54, 90):
+            if numpy_state[_, 0, 0] == 1:
+                color = (_ // 6) - 9
+                new_game.passive_color_order[color] = (_ % 6) + 1
+
+                loci, locj = np.where(new_game.active_board == color + 12)
+                new_game.passive_color_groups[color].append((loci[0], locj[0]))
+
+        self.game = new_game
+        self.plot()
+
 
 #
 # # todo correct this to make it work with the new board system in the patterns game:

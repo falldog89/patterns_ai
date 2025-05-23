@@ -198,18 +198,83 @@ class Patterns:
         return placing_actions + flipping_actions
 
     def is_action_terminal(self, action: int) -> bool:
-        """ bool return determine whether taking said action would end the game.
+        """
+        An action will prove terminal if the passive player will be left with no moves
+        after it is taken.
 
-        It will end the game if, as a result of the action, the next player will not be able to take a move.
+        todo improve by considering cases 1 at a time for performance:
         """
         if action >= 104:
             return False
 
         # the location being flipped and the orthogonal neighbors:
         removed_location = location_to_coordinates[action % 52]
+        color = self.active_bowl_token if action < 52 else self.active_board[removed_location]
+
+        #######
+        ### series of early termination checks for most situations:
+        #######
+
+        # if placing actions are still allowed:
+        if not self.is_no_more_placing:
+
+            # Easy win checks on placing actions:
+            if self.passive_bowl_token != color:
+
+                # if the passive bowl token color has not been taken by passive yet:
+                if self.passive_color_order[self.passive_bowl_token] == 0:
+                    if self.active_color_order[self.passive_bowl_token] == 0:
+                        # if neither player has this group, the game cannot end:
+                        return False
+
+                    # number of the passive bowl token flipped by the active player:
+                    num_current_active = len(self.active_color_groups[self.passive_bowl_token])
+
+                    # the number of empty locations that cannot be orthogonal to active color group:
+                    # 52 locations - (number flipped - n) - (3 * n + 2) orthogonals - 1 taken location:
+                    if (52 - len(self.flipped_locations) - 2 * num_current_active - 3) > 0:
+                        # there must be at least 1 flipping location:
+                        return False
+
+                else:
+                    # if passive is adding to a color group, active hasn't taken that color group,
+                    # can place unless the only spot remaining is taken by the above placing:
+                    if self.active_color_order[self.passive_bowl_token] == 0:
+                        # as long as there are 2 spots to place, you are safe:
+                        if len(self.passive_orthogonal_groups[self.passive_bowl_token]) > 1:
+                            return False
+
+                    else:
+                        if len(self.passive_orthogonal_groups[self.passive_bowl_token]
+                               - self.active_orthogonal_groups[self.passive_bowl_token]) > 1:
+                            return False
+
+            else:
+                # can place with freedom:
+                if self.passive_color_order[color] == 0:
+                    if self.active_color_order[color] == 0:
+                        return False
+
+                    num_current_active = len(self.active_color_groups[color])
+                    if (52 - len(self.flipped_locations) - 2 * num_current_active - 5) > 0:
+                        return False
+
+        # Easy win checks on flipping actions: if you have flipping actions in two different color groups, you
+        # cannot be ended! Further if you have a flipping action that is not in the VonNeumann neighborhood,
+        # you cannot end the game:
+        non_empty_flipping_groups = 0
+        for _color, _locations in self.passive_flipping_groups.items():
+            if len(_locations) > 0:
+                non_empty_flipping_groups += 1
+
+                if non_empty_flipping_groups >= 2:
+                    return False
+
+        #####################
+
+        # now complete the rigorous check for the remaining edge cases:
         removed_orthogonal = orthogonal_neighbors[removed_location]
         set_removed_location = {removed_location}
-        color = self.active_bowl_token if action < 52 else self.active_board[removed_location]
 
         if self.is_no_more_placing:
             placing_locations = set()
