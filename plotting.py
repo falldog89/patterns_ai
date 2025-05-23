@@ -10,6 +10,8 @@ import numpy as np
 from matplotlib import patches
 import matplotlib.image as mpimg
 import random
+import torch
+from typing import Optional
 
 from game import Patterns
 from int_to_board import location_to_coordinates
@@ -17,11 +19,19 @@ from int_to_board import location_to_coordinates
 
 class PatternPlotter:
     def __init__(self,
-                 game: Patterns,
+                 game: Optional[Patterns] = None,
+                 game_tensor: Optional[torch.tensor] = None,
                  ) -> None:
-        """ check thorughout for (x, y) versus (i, j)u
-        """
+        if (game is None) and (game_tensor is None):
+            raise ValueError("You must provide either a game or a tensor...")
+
         self.game = game
+        self.game_tensor = game_tensor
+
+        # if a game was not provided, create one for plotting from the tensor state:
+        if self.game is None:
+            self.create_plotting_game_from_tensor_state()
+
         self.axis_xlimits = [-6.5, 13.5]
         self.axis_ylimits = [-4.5, 11.5]
 
@@ -277,10 +287,9 @@ class PatternPlotter:
         ax.set_yticks([])
         plt.show()
 
-    def create_plotting_game_from_tensor_state(self, tensor_state) -> None:
+    def create_plotting_game_from_tensor_state(self) -> None:
         """ just want to test and check that our augmentations of the tensor state are correct
         """
-
         # tensor state structure:
         # layers 0 - 17: 8x8 patters board.
         # 0 - 5: neutral colors
@@ -291,7 +300,7 @@ class PatternPlotter:
         # layers 54 - 89 are p2 color order.
         # layers 90 - 101 are bowl tokens for each player
 
-        numpy_state = tensor_state.numpy()
+        numpy_state = self.game_tensor.numpy()
 
         new_game = Patterns()
 
@@ -328,7 +337,6 @@ class PatternPlotter:
                 new_game.passive_color_groups[color].append((loci[0], locj[0]))
 
         self.game = new_game
-        self.plot()
 
 
 #

@@ -646,6 +646,8 @@ class Tree:
 
         # todo: weighted average of results from a given position?
         final_results = [result] * save_len
+        save_games = [0] * save_len
+        save_nodes = [0] * save_len
 
         # work backwards up through the tree, storing the states and the visit counts:
         for _ in range(save_len - 1, -1, -1):
@@ -657,6 +659,9 @@ class Tree:
             full_visit_counts = np.zeros(107, dtype=int)
             full_visit_counts[nod.possible_actions] = nod.child_visit_counts
             visit_counts[_] = full_visit_counts
+            save_games[_] = nod.game
+            save_nodes[_] = nod
+
             nod = nod.parent
 
-        return replay_tensors, visit_counts, final_results
+        return replay_tensors, visit_counts, final_results, save_games, save_nodes
