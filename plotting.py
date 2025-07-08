@@ -106,7 +106,7 @@ class PatternPlotter:
         """ draw the bowls for bowl tokens, and add those tokens if they have been chosen.
         Further, highlight the active players bowl with a golden outline:
         """
-        # highlioht active player bowl, that is the player who will be playing next:
+        # highlight active player bowl, that is the player who will be playing next:
         active_center = self.bowl_centers[0] if self.game.active_player == 1 else self.bowl_centers[1]
         axis.add_patch(
             patches.Circle(
@@ -162,6 +162,18 @@ class PatternPlotter:
                                facecolor=self.token_colors[p2_hand],
                                )
                          )
+
+        # mark the board to indicate when no more placing is allowed:
+        if self.game.is_no_more_placing:
+            axis.scatter(self.bowl_centers[0][0], self.bowl_centers[0][1],
+                         s=1000,
+                         c='red',
+                         marker='x')
+
+            axis.scatter(self.bowl_centers[1][0], self.bowl_centers[1][1],
+                         s=1000,
+                         c='red',
+                         marker='x')
 
     def draw_token_spaces(self, axis) -> None:
         """ the spaces in which the order tokens will sit
@@ -304,15 +316,17 @@ class PatternPlotter:
 
         new_game = Patterns()
 
-        for _ in range(90, 95):
-            if numpy_state[_, 0, 0] == 1:
-                new_game.active_bowl_token = _ - 90
+        for _it, _is_color in enumerate(numpy_state[90:, 0, 0]):
+            if _is_color == 1:
                 break
 
-        for _ in range(96, 101):
-            if numpy_state[_, 0, 0] == 1:
-                new_game.passive_bowl_token = _ - 96
+        new_game.active_bowl_token = _it
+
+        for _it, _is_color in enumerate(numpy_state[96:, 0, 0]):
+            if _is_color == 1:
                 break
+
+        new_game.passive_bowl_token = _it
 
         # populate the board:
         new_game.active_board = np.zeros((8, 8), dtype=int)
@@ -335,6 +349,13 @@ class PatternPlotter:
 
                 loci, locj = np.where(new_game.active_board == color + 12)
                 new_game.passive_color_groups[color].append((loci[0], locj[0]))
+
+        # also populate the is no more placing characteristic:
+        if numpy_state[-1, 0, 0] == 1:
+            new_game._is_no_more_placing = True
+
+        else:
+            new_game._is_no_more_placing = False
 
         self.game = new_game
 

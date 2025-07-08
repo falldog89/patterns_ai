@@ -31,6 +31,23 @@ Once a player cannot flip anymore, all remaining moves are taken in one go. Ie a
 flips are flipped.
 
 ###############################################
+
+NOTE the first time that a player cannot make a placing move, the game changes state; no placing move for either
+player will be allowed again.
+
+The first time this happens will be down to the active player having no placing moves, but this is not true
+for subsequence players.
+
+Therefore, the important thing is for the state to change AFTER the move?
+
+In particular, it doesn't really matter WHEN the state changes the first time, because there IS not legal action
+anyway. However, it would be nice to occur at initialization.
+
+I think I am arguing, after all this, that the child state NEVER needs to know its own state, only the parents.
+However, when the game is made and children are created that will involve checking for is no more placing,
+so as long as create state happens after that, we are safe enough. It does mean that two equivalent states
+can describe the same game state, but that is fine! However, it does also mean that if a game is created and
+it was never queried, we might have to be careful.
 """
 import random
 import numpy as np
@@ -43,15 +60,15 @@ from int_to_board import orthogonal_neighbors, loci, locj, location_to_coordinat
 class Patterns:
     def __init__(self, clone_game: Optional[Self] = None) -> None:
         self.action_space = (107,)
-        self.state_space = (66,)
 
         if clone_game is not None:
             self.clone(clone_game)
             return
 
         # track the board as well, as this will be used in the NN implementation:
-        self.active_board = np.zeros((8, 8), dtype=int)
-        self.passive_board = np.zeros((8, 8), dtype=int)
+        # set to 18 rather than 0 so that corners are different from the other values
+        self.active_board = 18 * np.ones((8, 8), dtype=int)
+        self.passive_board = 18 * np.ones((8, 8), dtype=int)
         self.active_color_order = [0] * 6
         self.passive_color_order = [0] * 6
 
@@ -69,7 +86,7 @@ class Patterns:
         self.flipped_locations = set()
 
         # Once this flag is True, no more placing actions are allowed for either player:
-        self.is_no_more_placing = False
+        self._is_no_more_placing: Optional[bool] = None
 
         # active and passive bowl tokens:
         self.active_bowl_token, self.passive_bowl_token = 0, 1#
@@ -91,6 +108,13 @@ class Patterns:
         self.active_placing_number, self.passive_placing_number = 1, 1
         self.initialize_boards() # populate an initial random state:
 
+        # rather than recalculating, store the calculated placing actions:
+        self._placing_actions: Optional[list[int]] = None
+        # distinguish between the actual placing actions, which considers is_no_more_placing, and this, which is
+        # used in the definition of is_no_more_placing
+        self._possible_placing_coordinates: Optional[list[tuple[int, int]]] = None
+        self._flipping_actions: Optional[list[int]] = None
+
     def clone(self, patterns_game: Self) -> None:
         """ populate this game with an identical copy:
         Make sure deep not shallow copy:
@@ -102,6 +126,10 @@ class Patterns:
         # slice copy lists:
         self.active_color_order = patterns_game.active_color_order[:]
         self.passive_color_order = patterns_game.passive_color_order[:]
+        self._placing_actions = patterns_game._placing_actions[:] if patterns_game._placing_actions is not None else None
+        self._flipping_actions = patterns_game._flipping_actions[:] if patterns_game._flipping_actions is not None else None
+        self._possible_placing_coordinates = (patterns_game._possible_placing_coordinates[:] if
+                                              patterns_game._possible_placing_coordinates is not None else None)
 
         # single numbers: no need to copy:
         self.turn_number = patterns_game.turn_number
@@ -110,7 +138,7 @@ class Patterns:
         self.is_terminal = patterns_game.is_terminal
         self.result = patterns_game.result
         self.active_player = patterns_game.active_player
-        self.is_no_more_placing = patterns_game.is_no_more_placing
+        self._is_no_more_placing = patterns_game._is_no_more_placing
         self.active_bowl_token = patterns_game.active_bowl_token
         self.passive_bowl_token = patterns_game.passive_bowl_token
         self.active_placing_number = patterns_game.active_placing_number
@@ -145,6 +173,35 @@ class Patterns:
         self.active_board[loci, locj] = initial_state
         self.passive_board[loci, locj] = initial_state
 
+    @property
+    def is_no_more_placing(self) -> bool:
+        """ We have is_no_more_placing as a property, so that if it is ever queried and the placing actions haven't
+        been checked, we check:
+
+        When a child is created, adopt the parent is no more placing flag, unless it is false, in which case
+        set it to None:
+        """
+        # if set to None, it means not checked yet. DO NOT use this setter if any parent game had it set to True:
+        if self._is_no_more_placing is None:
+            self.set_is_no_more_placing()
+
+        return self._is_no_more_placing
+
+    def set_is_no_more_placing(self) -> None:
+        """ determine whether there are any legal placing moves if the property has not been set.
+        """
+        # if the placing actions haven't been checked, cannot know:
+        if self._possible_placing_coordinates is None:
+            self.set_possible_placing_coordinates()
+
+        # If there are no possible legal placing actions, set the flag:
+        if not self._possible_placing_coordinates:
+            self._is_no_more_placing = True
+
+        # It was previously inconclusive and placing actions still exist:
+        else:
+            self._is_no_more_placing = False
+
     def calculate_score(self) -> tuple[int, int]:
         """ return the score for each player in the current state by looking at the
         color orders and the color groups
@@ -159,8 +216,12 @@ class Patterns:
         return active_score, passive_score
 
     def get_actions(self) -> list[int]:
-        """ a legal action is:
-        1. Place the hand piece you have on the board
+        """
+        At the start of the game, a player can choose to take 0 as bowl token,
+        swap for 1, or pass that choice to the other player.
+
+        After the game begins, a player may either:
+        1. Place a bowl token on the board
         2. Flip over a piece next to one of your own
         """
         # Either choose a color or pass the choice:
@@ -171,138 +232,233 @@ class Patterns:
         if self.first_turn_passed:
             return [104, 105]
 
+        # no op if already set:
+        self.set_placing_actions()
+        self.set_flipping_actions()
+
+        return self._placing_actions + self._flipping_actions
+
+    def set_placing_actions(self) -> None:
+        """ actions that involve placing the bowl token. Returns integer action, not coordinates
+        """
+        if self._placing_actions is not None:
+            return
+
         if self.is_no_more_placing:
-            placing_actions = []
+            self._placing_actions = []
+            return
+
+        # if the possible locations haven't been determined yet:
+        if self._possible_placing_coordinates is None:
+            self.set_possible_placing_coordinates()
+
+        # turn the coordinates into locations for the action space:
+        self._placing_actions = [coordinates_to_location[_coord] for _coord in self._possible_placing_coordinates]
+
+    def set_possible_placing_coordinates(self) -> None:
+        """ determine all the locations that are empty to be placed in, ignoring the is_no_more_placing flag
+        """
+        # if the active bowl token color group has not yet been taken:
+        if self.active_color_order[self.active_bowl_token] == 0:
+            # place in any unoccupied spot:
+            empty_spaces = (set(location_to_coordinates) - self.flipped_locations
+                            - self.passive_orthogonal_groups[self.active_bowl_token])
 
         else:
-            # if the active bowl token color group has not yet been taken:
-            if self.active_color_order[self.active_bowl_token] == 0:
-                # place in any unoccupied spot:
-                empty_spaces = (set(location_to_coordinates) - self.flipped_locations
-                                - self.passive_orthogonal_groups[self.active_bowl_token])
+            # place next to the existing group:
+            empty_spaces = (self.active_orthogonal_groups[self.active_bowl_token]
+                            - self.passive_orthogonal_groups[self.active_bowl_token])
 
+        self._possible_placing_coordinates = list(empty_spaces)
+
+    def set_flipping_actions(self) -> None:
+        """ flipping actions, which involve flipping a neutral token on the board that is adjacent to
+        a taken color group of the same color and not adjacent to an opponents token of the same color.
+        Additionally, flipping actions that would result in the same state as a placing action are not considered.
+        That is, if the bowl token is the same color, it is equivalent to flipping.
+        """
+        if self._flipping_actions is not None:
+            return
+
+        # if the placing actions are not already calculated, calculate them now:
+        if self._placing_actions is None:
+            self.set_placing_actions()
+
+        self._flipping_actions = [coordinates_to_location[_coord] + 52 for
+                                  _key, _val in self.active_flipping_groups.items() for _coord in _val
+                                  if not ((coordinates_to_location[_coord] in self._placing_actions)
+                                          and (_key == self.active_bowl_token))]
+
+    def _easy_win_placing(self, color: int, removed_location: tuple[int, int]) -> bool:
+        """
+        Efficiency function: it is easy to check that in most situations there is at least one move remaining
+        after an action is taken, and the game is not terminal. This function is a messy composition of these checks.
+
+        Returning True tells you that you have an easy win. No need to check further.
+
+        Return False is an inconclusive. We do not know and further conclusive checks will be required.
+        """
+        # if placing moves are no longer allowed, no easy win: need to check flips.
+        if self.is_no_more_placing:
+            return False
+
+        # the bowl token of the prospective player differs from the token to be flipped:
+        if self.passive_bowl_token != color:
+
+            # if the passive bowl token color has not been taken by passive yet:
+            if self.passive_color_order[self.passive_bowl_token] == 0:
+                # if neither player has this group, the game cannot end, as there MUST be those tokens left:
+                if self.active_color_order[self.passive_bowl_token] == 0:
+                    return True
+
+                # number of the passive bowl token flipped by the active player:
+                num_current_active = len(self.active_color_groups[self.passive_bowl_token])
+
+                # the number of empty locations that cannot be orthogonal to active color group:
+                # 52 locations - (number flipped - n) - (3 * n + 2) orthogonals - 1 taken location:
+                if (52 - len(self.flipped_locations) - 2 * num_current_active - 3) > 0:
+                    # If there is at least 1 flipping location, easy win:
+                    return True
+
+            # passive bowl token color has been taken by the passive color: they are adding to a color group:
             else:
-                # place next to the existing group:
-                empty_spaces = (self.active_orthogonal_groups[self.active_bowl_token]
-                                - self.passive_orthogonal_groups[self.active_bowl_token])
+                # active has not taken this color group yet:
+                if self.active_color_order[self.passive_bowl_token] == 0:
+                    # as long as there is one location that is not the removed location, placing is legal:
+                    if len(self.passive_orthogonal_groups[self.passive_bowl_token] - {removed_location}) > 0:
+                        return True
 
-            placing_actions = [coordinates_to_location[_coord] for _coord in empty_spaces]
+                # active has also taken this color:
+                else:
+                    # if there are at least 1 empty spots after removing the orthogonals and the removed location:
+                    if len(self.passive_orthogonal_groups[self.passive_bowl_token]
+                           - self.active_orthogonal_groups[self.passive_bowl_token] - {removed_location}) > 0:
+                        return True
 
-            # if no placing locations are possible, then set the flag
-            if not placing_actions:
-                self.is_no_more_placing = True
+        # the token being flipped matches the passive players bowl token:
+        else:
+            # if the passive player has not taken this color group yet:
+            if self.passive_color_order[color] == 0:
+                # and neither has the active player:
+                if self.active_color_order[color] == 0:
+                    # must be safe to place:
+                    return True
 
-        flipping_actions = [coordinates_to_location[_coord] + 52 for
-                            _key, _val in self.active_flipping_groups.items() for _coord in _val]
+                # if the active player has an existing color group of this color:
+                num_current_active = len(self.active_color_groups[color])
 
-        return placing_actions + flipping_actions
+                # the most spots that can be blotted out are flipped locations, 3 for the new flip, (because it adds
+                # to an existing group) plus twice the number of currently taken actives plus 2.
+                if (52 - len(self.flipped_locations) - 2 * num_current_active - 5) > 0:
+                    return True
+
+        return False
+
+    def _full_flipping_terminal(self,
+                                color: int,
+                                removed_location: tuple[int, int],
+                                removed_orthogonals: set[tuple[int, int]]) -> bool:
+        """ detect whether there will, with certainty, be at least one fliping move for the passive
+        player. Returns True if it detects a move, otherwise returns False and inconclusive.
+        """
+        set_removed_location = {removed_location}
+
+        # Check flipping actions first:
+        for _color, _set_of_coords in self.passive_flipping_groups.items():
+            # Additionally remove the orthogonals if colors match:
+            if _color == color:
+                if len(_set_of_coords - set_removed_location - removed_orthogonals) > 0:
+                    return False
+
+            # otherwise, only remove prospective location:
+            else:
+                # if there is a flipping location free, other than that occupied by the prospective action:
+                if len(_set_of_coords - set_removed_location) > 0:
+                    return False
+
+        # couldn't find a flipping move:
+        return True
+
+    def _full_placing_terminal(self,
+                               color: int,
+                               removed_location: tuple[int, int],
+                               removed_orthogonals: set[tuple[int, int]]) -> bool:
+        """ detect whether there will, with certainty be at least one placing move for the passive player.
+        Returns True if it detects terminality, otherwise False
+        """
+        set_removed_location = {removed_location}
+
+        # Definitely no placing moves:
+        if self.is_no_more_placing:
+            return True
+
+        bad_placing_locations = self.active_orthogonal_groups[self.passive_bowl_token] | set_removed_location
+
+        if color == self.passive_bowl_token:
+            bad_placing_locations |= removed_orthogonals
+
+        # determine all locations that the passive player could place their bowl token:
+        if self.passive_color_order[self.passive_bowl_token] == 0:
+            # if the passive bowl token color group has not been established:
+            placing_locations = set(location_to_coordinates) - self.flipped_locations - bad_placing_locations
+
+        else:
+            # the orthogonal groups already have the flipped locations removed:
+            placing_locations = self.passive_orthogonal_groups[self.passive_bowl_token] - bad_placing_locations
+
+        # if there would be a legal placing move after this :
+        if len(placing_locations) > 0:
+            return False
+
+        # no placing actions remaining:
+        return True
+
+    def _full_is_terminal(self, color: int, removed_location: tuple[int, int]) -> bool:
+        """ determine the full action set to decide whether the action could be terminal:
+        Returns True if the action will result in a terminal state, False if the game can continue,
+        ie if there will be at least one legal move for the passive player after the action is taken.
+        """
+        # Remove the new flipped location and potentially some orthogonals from possible placing locations:
+        removed_orthogonals = orthogonal_neighbors[removed_location]
+
+        # if False, there will be at least one legal flip action for the passive player:
+        is_flipping_terminal = self._full_flipping_terminal(color, removed_location, removed_orthogonals)
+
+        if not is_flipping_terminal:
+            return False
+
+        # no flipping actions, so check the placing actions rigorously:
+        return self._full_placing_terminal(color, removed_location, removed_orthogonals)
 
     def is_action_terminal(self, action: int) -> bool:
+        """ To check whether stepping by a given action from the current state would result in a
+        terminal state or not.
         """
-        An action will prove terminal if the passive player will be left with no moves
-        after it is taken.
-
-        todo improve by considering cases 1 at a time for performance:
-        """
+        # Initial actions cannot end the game:
         if action >= 104:
             return False
 
-        # the location being flipped and the orthogonal neighbors:
+        # determine the coordinates and color of the token affected (in either flipping or placing) after acting:
         removed_location = location_to_coordinates[action % 52]
         color = self.active_bowl_token if action < 52 else self.active_board[removed_location]
 
-        #######
-        ### series of early termination checks for most situations:
-        #######
-
-        # if placing actions are still allowed:
-        if not self.is_no_more_placing:
-
-            # Easy win checks on placing actions:
-            if self.passive_bowl_token != color:
-
-                # if the passive bowl token color has not been taken by passive yet:
-                if self.passive_color_order[self.passive_bowl_token] == 0:
-                    if self.active_color_order[self.passive_bowl_token] == 0:
-                        # if neither player has this group, the game cannot end:
-                        return False
-
-                    # number of the passive bowl token flipped by the active player:
-                    num_current_active = len(self.active_color_groups[self.passive_bowl_token])
-
-                    # the number of empty locations that cannot be orthogonal to active color group:
-                    # 52 locations - (number flipped - n) - (3 * n + 2) orthogonals - 1 taken location:
-                    if (52 - len(self.flipped_locations) - 2 * num_current_active - 3) > 0:
-                        # there must be at least 1 flipping location:
-                        return False
-
-                else:
-                    # if passive is adding to a color group, active hasn't taken that color group,
-                    # can place unless the only spot remaining is taken by the above placing:
-                    if self.active_color_order[self.passive_bowl_token] == 0:
-                        # as long as there are 2 spots to place, you are safe:
-                        if len(self.passive_orthogonal_groups[self.passive_bowl_token]) > 1:
-                            return False
-
-                    else:
-                        if len(self.passive_orthogonal_groups[self.passive_bowl_token]
-                               - self.active_orthogonal_groups[self.passive_bowl_token]) > 1:
-                            return False
-
-            else:
-                # can place with freedom:
-                if self.passive_color_order[color] == 0:
-                    if self.active_color_order[color] == 0:
-                        return False
-
-                    num_current_active = len(self.active_color_groups[color])
-                    if (52 - len(self.flipped_locations) - 2 * num_current_active - 5) > 0:
-                        return False
-
-        # Easy win checks on flipping actions: if you have flipping actions in two different color groups, you
-        # cannot be ended! Further if you have a flipping action that is not in the VonNeumann neighborhood,
-        # you cannot end the game:
-        non_empty_flipping_groups = 0
-        for _color, _locations in self.passive_flipping_groups.items():
-            if len(_locations) > 0:
-                non_empty_flipping_groups += 1
-
-                if non_empty_flipping_groups >= 2:
-                    return False
-
-        #####################
-
-        # now complete the rigorous check for the remaining edge cases:
-        removed_orthogonal = orthogonal_neighbors[removed_location]
-        set_removed_location = {removed_location}
-
-        if self.is_no_more_placing:
-            placing_locations = set()
-
-        else:
-            # Placing moves, flipping moves of same color, flipping moves of different colors:
-            if self.passive_color_order[self.passive_bowl_token] == 0:
-                placing_locations = (set(location_to_coordinates) - self.flipped_locations
-                                     - self.active_orthogonal_groups[self.passive_bowl_token]
-                                     - set_removed_location)
-
-            else:
-                placing_locations = (self.passive_orthogonal_groups[self.passive_bowl_token]
-                                     - self.active_orthogonal_groups[self.passive_bowl_token]
-                                     - set_removed_location)
-
-        same_color_flipping_locations = self.passive_flipping_groups[color] - set_removed_location - removed_orthogonal
-        different_color_flipping_locations = set([_coord for _key, _val in self.passive_flipping_groups.items()
-                                                  for _coord in _val if _key != color]) - set_removed_location
-
-        if color == self.passive_bowl_token:
-            placing_locations -= removed_orthogonal
-
-        # if there will be a single move remaining, the game is not terminal:
-        if len(placing_locations) + len(same_color_flipping_locations) + len(different_color_flipping_locations) > 0:
+        # returns True if you find out the game is not terminal:
+        if self._easy_win_placing(color, removed_location):
             return False
 
-        return True
+        # returns True if the game IS terminal, False if the game is NOT terminal:
+        return self._full_is_terminal(color, removed_location)
+
+    def reset_properties(self) -> None:
+        """ make sure that all properties are set to None after a move is taken
+        """
+        self._possible_placing_coordinates = None
+        self._placing_actions = None
+        self._flipping_actions = None
+
+        # only reset this property after a step if False:
+        if not self.is_no_more_placing:
+            self._is_no_more_placing = None
 
     def swap_players(self) -> None:
         """ swap the player and update all the pointers to the correct attributes
@@ -362,20 +518,16 @@ class Patterns:
             # function to update the various orthogonals and valid moves attributes:
             self.update_locations(coords)
 
+        self.reset_properties()
+
         if is_game_terminal:
-            # just being sure nothing slips through the cracks, but I believe it should not be possible to arrive
-            # here without this flag set...
-            self.is_no_more_placing = True
-
-            # take actions until the game ends, without swapping players:
-            actions = self.get_actions()
-
-            while actions:
-                self.step(actions[0])
-                actions = self.get_actions()
+            # take all remaining flipping actions:
+            self.finish_game()
 
             # Calculate the score:
             active_score, passive_score = self.calculate_score()
+
+            # Result is a 1 if the active player wins, 0 if draw, -1 if the passive player wins:
             result = 0 if active_score == passive_score else 1 if active_score > passive_score else -1
 
             # store the result
@@ -388,6 +540,36 @@ class Patterns:
         self.swap_players()
 
         return False, None
+
+    def finish_game(self) -> None:
+        """ once the game is in a terminal state, players are allowed to take all possible flipping actions.
+
+        Keep taking actions WITH A SINGLE PLAYER until all actions are used up.
+
+        Remember to reset the properties each time a step is taken.
+        """
+        # It is possible that the opponent won't have a move, so set _is_no_more_placing
+        # at this point:
+        self._is_no_more_placing = True
+
+        # reset the properties so that new moves are calculated:
+        self.reset_properties()
+
+        # take all legal flipping actions from this point on:
+        actions = self.get_actions()
+
+        while actions:
+            # take a random flipping action:
+            next_action = actions.pop()
+
+            # update the board and attributes as usual:
+            location = next_action % 52
+            coords = loci[location], locj[location]
+            self.update_locations(coords)
+
+            # reset properties and check for new flipping actions:
+            self.reset_properties()
+            actions = self.get_actions()
 
     def update_locations(self, coords: tuple[int, int]) -> None:
         """ Update the active and passive location-sensitive attributes, to

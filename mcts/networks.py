@@ -21,7 +21,7 @@ class PatternsNet(nn.Module):
     fun on it:
     """
     def __init__(self,
-                 in_channels: int = 102,
+                 in_channels: int = 103,
                  out_channels: int = 64,
                  ) -> None:
         """ 102 in channels for patterns. 18 for color and player, 72 for color group order, 12 for bowl tokens.
@@ -47,6 +47,8 @@ class PatternsNet(nn.Module):
         # (samples, out * 4, 2, 2)
         self.standard1 = ResidualLayer(in_channels=out_channels, stride=1)
         self.standard2 = ResidualLayer(in_channels=out_channels, stride=1)
+        self.standard3 = ResidualLayer(in_channels=out_channels, stride=1)
+        self.standard4 = ResidualLayer(in_channels=out_channels, stride=1)
 
         # different heads:
         self.twoheadlayer = TwoHeadNet(in_channels=out_channels,
@@ -59,7 +61,8 @@ class PatternsNet(nn.Module):
         of filters required, before passing through the residual blocks """
         x = self.input_layer(x)
         x = self.down2(self.down1(x))
-        x = self.standard2(self.standard1(x))
+
+        x = self.standard4(self.standard3(self.standard2(self.standard1(x))))
 
         return self.twoheadlayer(x)
 

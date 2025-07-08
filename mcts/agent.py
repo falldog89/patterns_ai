@@ -51,6 +51,11 @@ AGENT:
 
 Note we do not want to store tensor states for the games, as
 
+When we are storing games, we store them in a dict according to
+    1. game length. As lots of games can end in sudden defeats we are not too interested in
+            storing eg 3rd move losses forever
+    2. win or loss or draw.
+
 """
 import torch
 from typing import Optional
@@ -81,6 +86,7 @@ class Agent:
                  # This is a TREE quantity, not a NODE quantity. If 0 is given for explore steps,
                  # random exploration is used instead!
                  explore_steps_schedule: Optional[list[tuple]] = None,
+                 debug: bool = False,
                  ):
         # unique string for this agent, for the cpu driver to provision
         self.agent_id = agent_id
@@ -100,8 +106,11 @@ class Agent:
         # track number of games completed:
         self.num_completed = 0
         self.target_games = target_games
-        self.completed_games = []
 
+        # Separate replay buffers for the terminal states of the games:
+        self.completed_games = {-1: [], 0: [], 1: []}
+
+        # exploration breadth statistics:
         self.topn = topn
         self.randn = randn
 
@@ -129,6 +138,9 @@ class Agent:
                     schedule=self.explore_steps_schedule,
                 )
             )
+
+        self._debug = debug
+        self._debug_leaf = None
 
     def create_root_nodes(self) -> None:
         """ create the necessary number of games, evaluate the tensor states,
@@ -215,13 +227,18 @@ class Agent:
             _tree.step(action_argument)
 
             if _tree.root_node.result is not None:
-                _game = _tree.get_replay_game(save_depth=self.save_depth)
+                # if debug is true, also includes the save nodes and the root node:
+                _replay, _final_result  = _tree.get_replay_game(save_depth=self.save_depth, is_save_nodes=self._debug)
+                self.completed_games[_final_result].extend(_replay)
 
+                # break if the number of completed games is sufficient:
+                if self.num_completed >= self.target_games:
+                    return
+
+                # If continuing, claim a new root node, reset the tree:
                 new_root_node = self.root_nodes.pop()
                 _tree.reset(new_root_node)
-
                 self.num_completed += 1
-                self.completed_games.append(_game)
 
     def explore(self) -> tuple[list[Node], list[Tree], list[Node], list[torch.tensor]]:
         """ explore each tree, and return a list of all the leaf nodes"""
@@ -234,8 +251,10 @@ class Agent:
             # flow to leaf node following puct scores, or randomly:
             leaf_node = _tree.get_leaf_node()
 
+            self._debug_leaf = leaf_node
+
             # expand the leaf, either return yourself if you haven't been seen before, or create children and
-            # return one at random otherwise. Set a flag to detemine if you need inference:
+            # return one at random otherwise. Set a flag to determine if you need inference:
             leaf_node = leaf_node.expand()
 
             all_nodes.append(leaf_node)
@@ -245,8 +264,7 @@ class Agent:
                 ready_trees.append(_tree)
 
             # Determine which require inference:
-            # todo figure out random works for this. No tensor state requires it:
-            if not leaf_node.tensor_state:
+            if leaf_node.tensor_state is not None:
                 inference_nodes.append(leaf_node)
                 leaf_node.create_tensor_state()
                 tensor_states.append(leaf_node.tensor_state)
