@@ -208,7 +208,7 @@ class StateAugmentor:
             new_game._is_no_more_placing = None
 
         # assume that if we are validating, or wishing to create game from state, the game has started proper:
-        # todo consider this for the long future, when we are predicting first moves from the board state...
+        # todo reconsider this for the long future, when we are predicting first moves from the board state...
         new_game.is_game_started = True
         new_game.first_turn_passed = False
 

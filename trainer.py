@@ -199,6 +199,7 @@ class PatternTrainer:
                                 visit_counts: torch.tensor,
                                 results: torch.tensor,
                                 is_augment: bool = True,
+                                is_mask: bool = False,
                                 ) -> tuple[torch.tensor, torch.tensor, torch.tensor, torch.tensor]:
         """ Take in the data in the form of states, visit counts and results and
         return the predictions and targets together.
@@ -211,8 +212,11 @@ class PatternTrainer:
         # get the predicted results and the policy vectors for the states considered:
         predicted_results, prior_policies = self.network(states.to(self.device).float())
 
-        # in place masking of the prior policies:
-        self.mask_policies(prior_policies, visit_counts)
+        # option to mask or not mask the options. To learn something to start with (legal moves)
+        # it might help to NOT mask?
+        if is_mask:
+            # in place masking of the prior policies:
+            self.mask_policies(prior_policies, visit_counts)
 
         # normalize the visit counts to form a prior policy:
         visit_counts = visit_counts / visit_counts.sum(1).view(-1, 1)
@@ -225,9 +229,10 @@ class PatternTrainer:
               is_augment: bool = False,
               epochs: int = 100,
               batch_size: int = 1024,
-              is_include_policy: bool=True,
-              is_plot_losses: bool=True,
+              is_include_policy: bool = True,
+              is_plot_losses: bool = True,
               learning_rate: float = 3e-4,
+              is_mask_policy: bool = False,
               ) -> None:
         """
         Load data from location on disk.
@@ -266,7 +271,8 @@ class PatternTrainer:
             vtarget, vpredictions, ptarget, ppredictions = self.get_targets_predictions(_states,
                                                                                         _visit_counts,
                                                                                         _results,
-                                                                                        is_augment)
+                                                                                        is_augment,
+                                                                                        is_mask_policy)
 
             # loss function is MSE value and CE policy, unless policy is explicitly neglected:
             loss = self.loss_function(vtarget, vpredictions, ptarget, ppredictions, is_include_policy)
@@ -296,7 +302,8 @@ class PatternTrainer:
                       vpredictions: torch.tensor,
                       ptarget: torch.tensor,
                       ppredictions: torch.tensor,
-                      is_include_policy=True) -> torch.nn.Module:
+                      is_include_policy: bool = True,
+                      ) -> torch.nn.Module:
         """ the loss function for the alpha zero style training. Cross entropy for policy,
         added to MSE for target
 
@@ -322,26 +329,72 @@ class PatternTrainer:
 
         ax.plot(self.losses)
 
-# todo next step:
-    # investigate WHICH ones it does badly on, and why.
-    # WILL IT HELP to introduce visit counts? Lets look a little bit, and think about what is going on
-    # try and understand why it cannot get better fitting
+    def validate(self,
+                 data_location: str,
+                 num_check: int = 1000,
+                 is_augment: bool = True,
+                 ) -> tuple:
+        """ We want to see whether the outputs has started to learn the space even with out masking?
 
-    def get_MSE_accuracy(self,
-                         game_list: list,
-                         num_required: int,
-                         batch_size: int=2048,
-                         is_augment: bool=True) -> torch.tensor:
+        We are not interested in the output when there is only one legal action, but we would like it to learn
+        when actions are equally good or bad?
+        """
+
+        validation_games = self.load_data(data_location)
+
+        # set network to eval mode:
+        self.network.eval()
+
+        # split the data set:
+        wins = validation_games[1]
+        losses = validation_games[-1]
+        draws = validation_games[0]
+
+        # return the value and prior predictions, target visit count, flipped count, and score difference:
+        # win_vp, win_pp, win_targets, win_fc, win_sd = self.validation_get_targets_predictions(wins, num_check, is_augment=is_augment)
+        # loss_vp, loss_pp, loss_targets, loss_fc, loss_sd = self.validation_get_targets_predictions(losses, num_check, is_augment=is_augment)
+        # draw_vp, draw_pp, draw_targets, draw_fc, draw_sd = self.validation_get_targets_predictions(draws, num_check, is_augment=is_augment)
+
+        win_tuple = self.validation_get_targets_predictions(wins, num_check, is_augment=is_augment)
+        loss_tuple = self.validation_get_targets_predictions(losses, num_check, is_augment=is_augment)
+        draw_tuple = self.validation_get_targets_predictions(draws, num_check, is_augment=is_augment)
+
+        return win_tuple, loss_tuple, draw_tuple
+        # # win predictions should be
+        # win_accuracy = (((win_vp - 1.0) ** 2.0).sum() / len(win_vp)) ** 0.5
+        # loss_accuracy = (((loss_vp + 1.0) ** 2.0).sum() / len(loss_vp)) ** 0.5
+        # draw_accuracy = (((draw_vp - 0.0) ** 2.0).sum() / len(draw_vp)) ** 0.5
+        #
+        # if is_plot:
+        #     fig, ax = plt.subplots()
+        #     ax.scatter(win_sd, win_vp)
+        #     ax.scatter(loss_sd, loss_vp)
+        #     ax.scatter(draw_sd, draw_vp)
+
+        # return win_accuracy, loss_accuracy, draw_accuracy
+
+    def validation_get_targets_predictions(self,
+                                           game_list: list,
+                                           num_required: int,
+                                           batch_size: int = 2048,
+                                           is_augment: bool = True) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """ determine how accurately the network is predicting the output of the given state
         by comparing the actual and predicted states in hold out data:
         """
+        values = []
+        priors = []
+        actual_vcs = []
+        points_difference = []
 
-        predictions = []
         flipped_nums = []
 
-        while len(predictions) < num_required:
+        for _it in range((num_required // batch_size) + 1):
             # collect sample of games:
-            sample_games = game_list[:batch_size]
+            sample_games = game_list[(_it * batch_size):((_it + 1) * batch_size)]
+
+            # if out of samples to take:
+            if len(sample_games) == 0:
+                break
 
             # get the states from the games:
             _states, _vcs, _, _flipped_num, _ = zip(*sample_games)
@@ -353,131 +406,30 @@ class PatternTrainer:
             # augment the states:
             states, visit_counts = self.augment_sample(state_tensor, vc_tensor, is_augment=is_augment)
 
+            # see if it is better at understanding when the score is more even
+            state_scores = states[:, -4:-2, 0, 0]
+            _score_diff = state_scores[:, 0] - state_scores[:, 1]
+
             # get the predicted results and the policy vectors for the states considered:
             with torch.no_grad():
-                # do not collect the prior policy here:
-                value_predictions, _ = self.network(states.to(self.device).float())
+                value_predictions, prior_predictions = self.network(states.to(self.device).float())
 
-            # return the value predictions locally:
-            predictions.append(value_predictions.cpu())
+            # return the value and prior predictions locally:
+            values.append(value_predictions.cpu())
+            priors.append(prior_predictions.cpu())
+            actual_vcs.append(visit_counts)
+            points_difference.append(_score_diff)
             flipped_nums.append(_flipped_num)
 
-            # trim the wins list:
-            game_list = game_list[batch_size:]
-
-            if batch_size * num_required >= num_required:
-                break
-
         # turn the list of tensors into a single tensor:
-        predictions = torch.stack(predictions)
-        number_flipped_tokens = np.stack(flipped_nums)
+        value_predictions = torch.concat(values).numpy()
 
-        return predictions, number_flipped_tokens
-
-    def validate_value(self,
-                       data_location: str,
-                       num_check: int = 1000,
-                       is_augment: bool = True,
-                       is_plot: bool = True) -> tuple[float, float, float]:
-        """ validate the data on positions to which an answer is known. For example one move win loss draw.
-
-        Validations occur in two steps:
-
-        1. We investigate how accurately the network predicts the results. In particular,
-        what is the difference between the predicted results and the actual, in MSE terms
-
-        2. We determine whether the action advocated for by the network is
-        """
-        # the validation data set only includes games that are a single move away from a loss or a win.
-        # If the game was won, there might be multiple acceptable actions, whereas in a 1 move loss, every move
-        # will result in a loss so there is no point in value-ing the moves.
-        validation_games = self.load_data(data_location)
-
-        # set network to eval mode:
-        self.network.eval()
-
-        # split the data set:
-        wins = validation_games[1]
-        losses = validation_games[-1]
-        draws = validation_games[0]
-
-        win_predictions, win_length = self.get_MSE_accuracy(wins, num_check, is_augment=is_augment)
-        loss_predictions, loss_length = self.get_MSE_accuracy(losses, num_check, is_augment=is_augment)
-        draw_predictions, draw_length = self.get_MSE_accuracy(draws, num_check, is_augment=is_augment)
-
-        # win predictions should be
-        win_accuracy = ((( win_predictions.numpy() - 1.0) ** 2.0).sum() / len(win_predictions)) ** 0.5
-        loss_accuracy = ((( loss_predictions.numpy() + 1.0) ** 2.0).sum() / len(loss_predictions)) ** 0.5
-        draw_accuracy = ((( draw_predictions.numpy() - 0.0) ** 2.0).sum() / len(draw_predictions)) ** 0.5
-
-        if is_plot:
-            fig, ax = plt.subplots()
-            ax.scatter(win_length, win_predictions)
-            ax.scatter(loss_length, loss_predictions)
-            ax.scatter(draw_length, draw_predictions)
-
-        return win_accuracy, loss_accuracy, draw_accuracy
+        # change these to probabilities now:
+        prior_predictions = torch.nn.functional.softmax(torch.concat(priors), dim = 1).numpy()
+        visit_count_targets = np.concatenate(actual_vcs)
+        number_flipped_tokens = np.concatenate(flipped_nums)
+        points_difference = torch.concat(points_difference).numpy()
 
 
-
-        #
-        # # todo
-        # # don't forget to set the network to eval mode in the getting targets predictions bit.:
-        # self.network.eval()
-        #
-        # # determine the predicted and actual results of the validation data:
-        # actual_results, predicted_results, _, predicted_actions  = self.get_targets_predictions(validation_data,
-        #                                                                                         batch_size,
-        #                                                                                         is_augment)
-        #
-        # # determine whether the predicted actions weight towards the correct result:
-        # policy_accuracy = self.check_predicted_actions(validation_data, predicted_actions, predicted_results)
-        #
-        # # extra wrangling to make sure that equivalently good moves are given equal priority: ie if there are multiple ways
-        # # of winning, you don't penalise not taking the "right" one:
-        #
-        # # MSE for correct value, between the actual results and the predicted value of the 1-move terminal states:
-        # correct_value = np.sum((actual_results - predicted_results) ** 2.) ** 0.5
-        #
-        # # How often was the 1 move win predicted by the policy. Do not look for 1 move losses:
-        #
-        # # hmmm. So the target data is the child visit counts from the state given in the data. But, when a winning move
-        # # is predicted, the step is cancelled after one additional explore step.
-        # #
-        # # We don't really care about the target move. We care about the predicted argmax producing a winning state.
-        #
-        #
-        # # mask out illegal or unconsidered moves: actual moves here will be the visit counts.
-        # max_args = predicted_moves[actual_moves > 0]
-        #
-        #
-        # predictions
-
-    def check_predicted_actions(self,
-                                states: torch.tensor,
-                                predicted_actions: torch.tensor,
-                                results: torch.tensor) -> list[bool]:
-        """ take the maximal argument from each prior policy prediction to determine whether
-        the highest weight prediction will acheive the correct result
-        """
-        # NOTE that if we are checking these, we are only checking one move wins and draws.
-        # That assumption is baked in:
-        accuracy = []
-
-        for _state, _prior_policy, _result in zip(states, predicted_actions, results):
-            # ignore non-winning results:
-            if _result == -1:
-                continue
-
-            # create a new game to test the prior policy:
-            _augmentor = StateAugmentor(_state)
-            _temp_game = _augmentor.create_game_from_state()
-
-            _predicted_best_action = np.argmax(_prior_policy)
-            _, _predicted_result = _temp_game.step(_predicted_best_action)
-
-            # if the predicted result matches the actual result:
-            accuracy.append(_predicted_result == _result)
-
-        return accuracy
+        return value_predictions, prior_predictions, visit_count_targets, number_flipped_tokens, points_difference
 

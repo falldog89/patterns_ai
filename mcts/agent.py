@@ -142,6 +142,11 @@ class Agent:
         self._debug = debug
         self._debug_leaf = None
 
+        self.all_nodes = []
+        self.inference_nodes = []
+        self.tensor_states = []
+        self.ready_trees = []
+
     def create_root_nodes(self) -> None:
         """ create the necessary number of games, evaluate the tensor states,
         and provision the full policy to each.
@@ -203,26 +208,28 @@ class Agent:
             # expand the leaf nodes, determine which require inference, which are done exploring and wish to step (after this step!)
             # exploration happens according to the tree schedule, for number of root explorations and for depth whether to
             # choose a node randomly or according to the policy and exploration policy stuff. Big speed up if just random!
-            all_leaf_nodes, ready_trees, inference_nodes, tensor_states = self.explore()
+
+            # run an exploration step for each tree. In particular, get leaf nodes:
+            self.explore()
 
             # calculate the inference, assign it to the relevant nodes:
-            self.assign_inference(tensor_states, inference_nodes)
+            self.assign_inference()
 
-            # back-propagate from each tree leaf node.
-            for _tree, _node in zip(self.trees, all_leaf_nodes):
+            # back-propagate from each tree leaf node:
+            for _tree, _node in zip(self.trees, self.all_nodes):
                 _tree.back_propagate(_node)
 
             # for those nodes that want to step, step them, check if terminal, and reset
-            self.step_trees(ready_trees)
+            self.step_trees()
 
             if self.num_completed != num_completed:
                 num_completed = self.num_completed
                 print(f"{self.num_completed} games have been completed!")
 
-    def step_trees(self, ready_trees: list[Tree]) -> None:
+    def step_trees(self):
         """ iterate over the trees that are ready to step...
         """
-        for _tree in ready_trees:
+        for _tree in self.ready_trees:
             action_argument = _tree.choose_action_argument()
             _tree.step(action_argument)
 
@@ -240,12 +247,12 @@ class Agent:
                 _tree.reset(new_root_node)
                 self.num_completed += 1
 
-    def explore(self) -> tuple[list[Node], list[Tree], list[Node], list[torch.tensor]]:
+    def explore(self) -> None: #-> tuple[list[Node], list[Tree], list[Node], list[torch.tensor]]:
         """ explore each tree, and return a list of all the leaf nodes"""
-        all_nodes = []
-        inference_nodes = []
-        tensor_states = []
-        ready_trees = []
+        self.all_nodes = []
+        self.inference_nodes = []
+        self.tensor_states = []
+        self.ready_trees = []
 
         for _tree in self.trees:
             # flow to leaf node following puct scores, or randomly:
@@ -257,24 +264,29 @@ class Agent:
             # return one at random otherwise. Set a flag to determine if you need inference:
             leaf_node = leaf_node.expand()
 
-            all_nodes.append(leaf_node)
+            self.all_nodes.append(leaf_node)
 
             # if the root node is sufficiently explored, or a mate in 1 detected:
             if _tree.is_step_ready:
-                ready_trees.append(_tree)
+                self.ready_trees.append(_tree)
 
-            # Determine which require inference:
-            if leaf_node.tensor_state is not None:
-                inference_nodes.append(leaf_node)
+            # Determine which require inference, ie those without a tensor state:
+            if leaf_node.tensor_state is None:
+                # create the tensor for the state of the leaf:
                 leaf_node.create_tensor_state()
-                tensor_states.append(leaf_node.tensor_state)
 
-        return all_nodes, ready_trees, inference_nodes, tensor_states
+                # store it internally to be evaluated and value, policy assigned:
+                self.inference_nodes.append(leaf_node)
+                self.tensor_states.append(leaf_node.tensor_state)
 
-    def assign_inference(self, tensor_states: list[torch.tensor], inference_nodes: list[Node]) -> None:
-        """ Inference step!
+    def assign_inference(self) -> None:
+        """ Evaluate the network on the nodes that require inference and provision
+        said inference to the internally stored nodes.
         """
-        tensor_stack = torch.stack(tensor_states)
+        if not self.tensor_states:
+            return
+
+        tensor_stack = torch.stack(self.tensor_states)
 
         # two head inference results:
         with torch.inference_mode():
@@ -284,7 +296,7 @@ class Agent:
         policy_stack = policy_stack.to("cpu", non_blocking=True).numpy()
 
         # provision the results of the value and policy to each leaf node:
-        for _leaf, _val, _pol in zip(inference_nodes, value_stack, policy_stack):
+        for _leaf, _val, _pol in zip(self.inference_nodes, value_stack, policy_stack):
             # value score is normalized in the network to be between -1 and 1:
             _leaf.value_score = _val
 

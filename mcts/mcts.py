@@ -103,8 +103,12 @@ class Node:
         self.full_policy: Optional[np.ndarray[np.double]] = None
         self.policy_vector: Optional[np.ndarray[np.double]] = None
 
+        # flag so that random trees remember to assign the children and so on correctly.
+        self.is_assigned_actions = False
+
     def populate_attributes(self) -> None:
         """ once a game is created, populate the various attributes:
+        NOTE that it should ALREADY HAVE a tensor state by here!
         """
         if not self.game:
             raise ValueError("You should have a game if you are populating attributes...")
@@ -115,12 +119,13 @@ class Node:
             return
 
         self.assign_actions_and_policy()
+        self.is_assigned_actions = True
 
         # MCTS attributes: note that possible actions already restricted above.
         arr_size = len(self.possible_actions)
         self.child_exploitation_scores = np.array([np.inf] * arr_size, dtype=float)
         self.child_visit_counts = np.ones(arr_size, dtype=int)
-        self.create_tensor_state()
+        # self.create_tensor_state()
 
     def assign_actions_and_policy(self) -> None:
         """ check whether the full policy is assigned yet, if it is, restrict to legal actions,
@@ -213,6 +218,11 @@ class Node:
             action = self.parent.possible_actions[self.parent_action_arg]
             self.game.step(action)
 
+        return self.populate_attributes_and_assign_children()
+
+    def populate_attributes_and_assign_children(self) -> Self:
+        """ after 2nd visit, populate all the attributes and then return a random child
+        """
         self.populate_attributes()
 
         # Games are populated only with a parent action argument and a parent to minimize copy time:
@@ -259,7 +269,7 @@ class Node:
         """
         # if game is populated, just use the board and state attributes from own game:
         if self.game is not None:
-            return (torch.tensor(self.game.active_board), self.game.active_color_order, self.game.passive_color_order,
+            return (np.array(self.game.active_board), self.game.active_color_order, self.game.passive_color_order,
                     self.game.active_bowl_token, self.game.passive_bowl_token, self.game.is_no_more_placing,
                     self.game.active_color_groups, self.game.passive_color_groups)
 
@@ -268,7 +278,7 @@ class Node:
         action = self.parent.possible_actions[self.parent_action_arg]
 
         # always use passive board, as we will swap players from the parent:
-        board = torch.tensor(game.passive_board)
+        board = np.array(game.passive_board)
 
         active_token = game.passive_bowl_token
         passive_token = game.active_bowl_token
@@ -299,13 +309,15 @@ class Node:
 
         # the passive token becomes the color at the location, the new location gets the COLOR of the passive token:
         if action < 52:
-            passive_token, board[coords] = board[coords].item(), passive_token
+            new_token = board[coords]
+            board[coords] = passive_token
+            passive_token = new_token
 
         # Whether flipping or placing, the location takes on the +12 of the passive player:
         board[coords] += 12
 
         # only the passive order can be updated...
-        if game.active_bowl_token not in game.active_color_groups:
+        if not game.active_color_groups[game.active_bowl_token]:
             passive_order[game.active_bowl_token] = game.active_placing_number
 
         return (board, active_order, passive_order, active_token, passive_token, game.is_no_more_placing,
@@ -342,7 +354,8 @@ class Node:
         board, aorder, porder, atoken, ptoken, place_bool, acolgroups, pcolgroups = self.get_state_attributes()
 
         # the board is just a one hot encoded version of the numpy board. value 18 (19th class) is board corners.
-        board_tensor = torch.nn.functional.one_hot(board.long(), num_classes=19)[:, :, :-1]
+        board_tensor = torch.nn.functional.one_hot(
+            torch.tensor(board).long(), num_classes=19)[:, :, :-1]
 
         # 36 channels for each player for color group: order mapping:
         order_tensor = torch.zeros((8, 8, 12), dtype=torch.float)
@@ -521,7 +534,14 @@ class Tree:
         """ Sample from the child actions vector according to the distribution formed from child visit counts:
         """
         if not self.root_node.possible_actions:
-            raise ValueError("The game has no valid actions, and should have ended...")
+            # This indicated that we have arrived here in a random game where this node has
+            # not been expanded correctly. We need to assign the actions
+            if not self.root_node.is_assigned_actions:
+                # If the root node has not expanded fully yet, complete here:
+                _ = self.root_node.populate_attributes_and_assign_children()
+
+            else:
+                raise ValueError("The game has no valid actions, and should have ended...")
 
         # If there is a winning move, the tree should take that action:
         if self.root_node.winning_action_arguments:
@@ -557,6 +577,11 @@ class Tree:
         """ Progress the tree according to the action argument.
 
         We increment the visit count and create a game if there isn't one, as we never need to backprop this.
+
+        Note that when a tree is taking RANDOM moves, it will be moving to
+        a child that has not been visited or seen before. These children will not have
+        tensor states, values or policies assigned.
+
         """
         # create new game for new root:
         game = Patterns(self.root_node.game)
@@ -566,8 +591,7 @@ class Tree:
         # step to new root node, taking the action selected:
         self.root_node = self.root_node.children[action_argument]
         self.root_node.game = game
-
-        self.root_node.visit_count += 1
+        self.root_node_explore_count = self.root_node.visit_count
 
         # reset the dirichlet noise:
         self._noise = None
@@ -585,7 +609,7 @@ class Tree:
         """ flow from the root node to an unexpanded leaf node, following the highest puct score:
 
         If a winning argument is presented, it is taken,
-        If a losing argument is not necesssary, it is not taken.
+        If a losing argument is not necessary, it is not taken.
         """
         # increment the root node EXPLORE count.
         self.root_node_explore_count += 1
@@ -598,8 +622,9 @@ class Tree:
         if self.root_node.winning_action_arguments:
             self.is_step_ready = True
 
-        # if this is a random player, do not perform exploration:
+        # if this is a random player, do not perform exploration, always ready to step
         if self.required_steps == 0:
+            self.is_step_ready = True
             return self.root_node
 
         # flow down from root to leaf following the best puct scores or winning arguments:
@@ -633,8 +658,8 @@ class Tree:
 
             return node.children[not_loss_args[np.argmax(filtered_puct)]]
 
-        # if no choice, just return a random loss:
-        return random.choice(self.root_node.losing_action_arguments)
+        # if no choice, just return a random child:
+        return random.choice(node.children)
 
     def calculate_child_puct_scores(self, node: Node) -> np.ndarray[float]:
         """ determine whether the node is the root node or not, and return the puct scores
