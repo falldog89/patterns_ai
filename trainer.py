@@ -244,6 +244,9 @@ class PatternTrainer:
 
         if is_balance_moves, sample equally (roughly?) from the move depth.
 
+        TODO change this now to cycle through and use all the data each time epoch wise?
+        how to do that with balancing the data for draws?
+
         """
         optimizer = torch.optim.AdamW(self.network.parameters(), lr=learning_rate)
 
@@ -303,6 +306,8 @@ class PatternTrainer:
                       ptarget: torch.tensor,
                       ppredictions: torch.tensor,
                       is_include_policy: bool = True,
+                      alpha: float = 1.0,
+                      beta: float = 0.1,
                       ) -> torch.nn.Module:
         """ the loss function for the alpha zero style training. Cross entropy for policy,
         added to MSE for target
@@ -310,12 +315,18 @@ class PatternTrainer:
         vpredictions and ppredictions have gradients from the generation of these from the network,
         vtarget and ptarget are visit counts and results from the MCTS, and do not have gradients.
 
-        """
-        loss = torch.nn.MSELoss()(vpredictions, vtarget.to(self.device))
+        Alpha and beta give weights to the relative importance of policy versus value.
 
-        if is_include_policy:
-            policy_loss = torch.nn.CrossEntropyLoss()(ppredictions, ptarget.to(self.device))
-            loss += policy_loss
+        In particular, for value to remain relevant
+
+        """
+        value_head_loss = torch.nn.MSELoss()(vpredictions, vtarget.to(self.device))
+
+        if not is_include_policy:
+            return value_head_loss
+
+        policy_head_loss = torch.nn.CrossEntropyLoss()(ppredictions, ptarget.to(self.device))
+        loss = alpha * value_head_loss + beta * policy_head_loss
 
         return loss
 
@@ -333,6 +344,7 @@ class PatternTrainer:
                  data_location: str,
                  num_check: int = 1000,
                  is_augment: bool = True,
+                 batch_size: int = 2048,
                  ) -> tuple:
         """ We want to see whether the outputs has started to learn the space even with out masking?
 
@@ -349,29 +361,18 @@ class PatternTrainer:
         wins = validation_games[1]
         losses = validation_games[-1]
         draws = validation_games[0]
+        #
+        # # iterate over the data, collecting samples, forming the relevant data:
+        # for _it in range((num_check // batch_size) + 1):
+        #
+        #     # collect a sample:
 
         # return the value and prior predictions, target visit count, flipped count, and score difference:
-        # win_vp, win_pp, win_targets, win_fc, win_sd = self.validation_get_targets_predictions(wins, num_check, is_augment=is_augment)
-        # loss_vp, loss_pp, loss_targets, loss_fc, loss_sd = self.validation_get_targets_predictions(losses, num_check, is_augment=is_augment)
-        # draw_vp, draw_pp, draw_targets, draw_fc, draw_sd = self.validation_get_targets_predictions(draws, num_check, is_augment=is_augment)
-
-        win_tuple = self.validation_get_targets_predictions(wins, num_check, is_augment=is_augment)
-        loss_tuple = self.validation_get_targets_predictions(losses, num_check, is_augment=is_augment)
-        draw_tuple = self.validation_get_targets_predictions(draws, num_check, is_augment=is_augment)
+        win_tuple = self.validation_get_targets_predictions(wins, num_check, batch_size=batch_size, is_augment=is_augment)
+        loss_tuple = self.validation_get_targets_predictions(losses, num_check, batch_size=batch_size, is_augment=is_augment)
+        draw_tuple = self.validation_get_targets_predictions(draws, num_check, batch_size=batch_size, is_augment=is_augment)
 
         return win_tuple, loss_tuple, draw_tuple
-        # # win predictions should be
-        # win_accuracy = (((win_vp - 1.0) ** 2.0).sum() / len(win_vp)) ** 0.5
-        # loss_accuracy = (((loss_vp + 1.0) ** 2.0).sum() / len(loss_vp)) ** 0.5
-        # draw_accuracy = (((draw_vp - 0.0) ** 2.0).sum() / len(draw_vp)) ** 0.5
-        #
-        # if is_plot:
-        #     fig, ax = plt.subplots()
-        #     ax.scatter(win_sd, win_vp)
-        #     ax.scatter(loss_sd, loss_vp)
-        #     ax.scatter(draw_sd, draw_vp)
-
-        # return win_accuracy, loss_accuracy, draw_accuracy
 
     def validation_get_targets_predictions(self,
                                            game_list: list,
@@ -425,11 +426,36 @@ class PatternTrainer:
         value_predictions = torch.concat(values).numpy()
 
         # change these to probabilities now:
-        prior_predictions = torch.nn.functional.softmax(torch.concat(priors), dim = 1).numpy()
+        # prior_predictions = torch.nn.functional.softmax(torch.concat(priors), dim = 1).numpy()
+        prior_predictions = torch.concat(priors).numpy()
         visit_count_targets = np.concatenate(actual_vcs)
+
+        # normalize the visit counts to form a prior policy:
+        visit_count_targets = visit_count_targets / np.expand_dims(visit_count_targets.sum(1), axis=1)
+
         number_flipped_tokens = np.concatenate(flipped_nums)
         points_difference = torch.concat(points_difference).numpy()
 
-
         return value_predictions, prior_predictions, visit_count_targets, number_flipped_tokens, points_difference
 
+    @staticmethod
+    def cross_entropy_loss(logits: np.ndarray, targets: np.ndarray) -> float:
+        """ targets are unnormalized logits from the nn, targets are probability distributions
+        derived from the normalized visit counts. Arguably we should put legal
+        moves back in to make it easier to learn?
+
+        Recall that the shape is (samples, action_space)
+        """
+        # demax to deal with exp. issues:
+        demaxed_logits = logits.T - np.max(logits, axis=1)
+        exp_logits = np.exp(demaxed_logits)
+        normed = exp_logits / np.sum(exp_logits, axis=0)
+
+        # safe way to deal with the very small logarithm values:
+        def safe_log(x, eps=1e-10):
+            result = np.where(x > eps, x, -10)
+            np.log(result, out=result, where=result > 0)
+            return result
+
+        # return the mean loss:
+        return -np.sum(safe_log(normed) * targets.T) / logits.shape[0]

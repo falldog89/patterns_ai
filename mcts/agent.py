@@ -217,7 +217,7 @@ class Agent:
 
             # back-propagate from each tree leaf node:
             for _tree, _node in zip(self.trees, self.all_nodes):
-                _tree.back_propagate(_node)
+                _tree.back_propagate()
 
             # for those nodes that want to step, step them, check if terminal, and reset
             self.step_trees()
