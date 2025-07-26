@@ -14,7 +14,7 @@ import torch
 from typing import Optional
 
 from game import Patterns
-from int_to_board import location_to_coordinates
+from constants import location_to_coordinates
 
 
 class PatternPlotter:

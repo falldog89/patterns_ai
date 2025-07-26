@@ -45,8 +45,8 @@ import random
 import numpy as np
 from typing import Optional, Self
 
-from int_to_board import orthogonal_neighbors, loci, locj, location_to_coordinates, coordinates_to_location
-from int_to_board import set_location_to_coordinates
+from constants import orthogonal_neighbors, loci, locj, location_to_coordinates, coordinates_to_location
+from constants import set_location_to_coordinates
 
 
 class Patterns:
@@ -189,7 +189,6 @@ class Patterns:
         """
         # evaluates to true if there are no possible placing coordinates, otherwise false:
         self._is_no_more_placing = not self.possible_placing_coordinates
-
 
     @property
     def possible_placing_coordinates(self) -> set[tuple[int, int]]:

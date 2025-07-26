@@ -9,4 +9,4 @@ class AgentWorker:
 
     def run(self):
         self.agent.run_games()
-        return self.agent.completed_games
+        return self.agent.replay_data

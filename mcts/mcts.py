@@ -1,208 +1,206 @@
-""" search tree code following MCTS algortithm, adapted to patterns.
+""" Node and Search tree for MCTS algorithm, similar to alpha zero.
 
-Extensions:
-1. Option for random play
-2. action space restricted to promote depth over breadth
-    - what about missing the terminal states... we could have a " is action terminal" checked
-        for each action in the action space, and ensure that is collected?
-3. Schedules for these.
-4. Schedules for exploration steps to spend the biccies deeper rather than early on, until the network
-    is learning something...
+Nodes contain information about the legal actions from their position, their parent,
+the value and policy verdict on the current position and functionality to create a tensor state
+for consumption by the NN.
 
-Extension 2.
-At the beginning of the learning process, when the network has not yet understood what
-is or is not a good position, the games can be played randomly. As more understanding is built up, and the network
-is better, the games should be played progressively less randomly. In this way, we reduce time spent on inference
-results before they are useful.
+The search tree has functions that relate to the tree search itself, including
+back propagation functions, a root node, the methods used to flow to a leaf etc.
 
-This requires two things to work
-1. we must make sure that NONE of the nodes are exploring with tensor, as this will remove the batching speed up
-    - one approach here, given there is no speed up associated with random play, is to assign the random policy
-        without switching back to the agent?
+We have implemented several extensions here.
 
-3. first session has random play anyway
-4. still need to assign random tensor to still restrict the exploration...
+### Extensions:
 
-Extension 4.
-Come up with a schedule for exploration steps that scales with depth. Ie start off with VERY few explorations,
-then do progressively more as you get deeper. Eg 10 explore, 20, 30 etc.
+Random play:
+The search tree can play randomly, which allows for far faster game generation
+in the early stage of the process, before any signal can be expected from the NNs.
 
-Okay so todo is:
-2. random play
-    For random play, we want to
-        avoid creating a tensor
-        avoid evaluation
-        STILL respect the restriction of the action space
-        assign a random full_policy and value?
-        NOT do all the exploring
-            we don't want to train from the random data
-            we don't want to spend resources playing like that
+A schedule can be set that will allow for random play for so many moves,
+before moving to search tree deeper into the game.
 
-            So I think we want to use random play with single look ahead. That is, scan for a terminal in one,
-            choose the best.
-3. schedule for exploration steps
+Our prior assumption is that game understanding will flow up the game from
+terminal positions to start positions, so that better understanding of game
+states close to terminal positions will happen sooner in the training process.
 
+Note that the search tree will always avoid losing moves if there are any
+non-losing options, and will always take a win if there is one available.
+
+The save depth may also be altered, so that distant-from-terminal positions
+are not trained on until deep into the process.
+
+Restricted search:
+Our prior assumption is that the training process might be improved by favoring deeper
+searches over broader ones. In particular, for a small number of exploration steps allowed,
+it might be better to spend these on following the expected best path rather than exploring
+every move once.
+
+The code allows the user to specify TOPN and RANDN moves. TOPN will search only the top
+n moves according to the prior policy, and RANDN will search a further N random moves to avoid
+blind spots. Setting these values to 108 will of course result in an unchanged search
+strategy.
+
+todo add __repr__
 """
 
 import numpy as np
 import random
 from typing import Optional, Self
-
 import torch
 
 from game import Patterns
-from int_to_board import loci, locj
-
-
-# for more efficiently creating one hot:
-EYE = torch.eye(19, dtype=torch.int)[:-1]  # shape (18, 19)
-
-# for more efficiently permuting the indices of the tensor to account for active and passive swapping:
-PERM_INDEX = [
-    ### board:
-    0, 1, 2, 3, 4, 5,
-    12, 13, 14, 15, 16, 17,
-    6, 7, 8, 9, 10, 11,
-
-    ### color orders:
-    24, 25, 26, 27, 28, 29,
-    18, 19, 20, 21, 22, 23,
-
-    ### bowl tokens:
-    36, 37, 38, 39, 40, 41,
-    30, 31, 32, 33, 34, 35,
-
-    ### is no more placing:
-    42,
-
-    ### score:
-    44,
-    43,
-
-    ### current bowl token value:
-    46,
-    45,
-]
+from constants import loci, locj
+from constants import EYE
+from constants import SWAP_ACTIVE_PASSIVE_INDEX
 
 
 class Node:
-    """ search tree node for patterns. Root node is populated with full policy and a game so that it can
-    populate the attributes correctly on first expansion.
+    """ Search tree node for patterns.
     """
+    __slots__ = ('parent_action_arg', 'game', 'parent', 'depth', 'restrict_topn',
+                 'restrict_randm', 'children', 'active_player', 'possible_actions',
+                 'result', 'winning_action_arguments', 'losing_action_arguments',
+                 'terminal_actions', 'child_exploitation_scores', 'child_visit_counts',
+                 'tensor_state', 'visit_count', 'accrued_reward', 'value_score',
+                 'full_policy', 'policy_vector', 'is_assigned_actions', 'is_inference_assigned')
     def __init__(self,
                  parent_action_arg: Optional[int] = None,
                  game: Optional[Patterns] = None,
                  parent: Optional[Self] = None,
                  depth: int = 0,
-                 breadth_restriction: Optional[int] = None,
-                 random_restriction: Optional[int] = None,
+                 restrict_topn: Optional[int] = None,
+                 restrict_randm: Optional[int] = None,
                  ) -> None:
-        # Note: every node must have either a parent action argument or a game.
+        ### Note: every node must have either a parent action argument or a game.
+
+        # argument for parent node possible_actions:
         self.parent_action_arg = parent_action_arg
+
+        # actual Patterns instance:
         self.game = game
+
+        # parent Node instance:
         self.parent = parent
+
+        # depth of the node in the search tree, with 0 being root-node depth:
         self.depth = depth
 
-        # parameters to reduce the breadth of the search and prioritise depth instead.
-        self.breadth_restriction = breadth_restriction
-        self.random_restriction = random_restriction
+        # Restrict to top n actions from prior policy. No restriction if None.
+        self.restrict_topn = restrict_topn or 107
 
+        # Additional m random actions are selected for unbiased exploration:
+        self.restrict_randm = restrict_randm or 0
+
+        # Store children in a list:
         self.children: list[Self] = []
         self.active_player = 1 if parent is None else -1 * parent.game.active_player
 
+        # list of actions (0-106)
         self.possible_actions: Optional[list[int]] = None
+
+        # None if game is not terminal, else -1, 0, 1 for loss, draw, win for active player:
         self.result: Optional[int] = None # trichotomy
 
-        # List of the action arguments that result in terminal positions in each direction:
+        # List of the action arguments that result in terminal positions:
         self.winning_action_arguments: list = []
         self.losing_action_arguments: list = []
 
-        # q: is it worth removing the tensor state once it has been used up to avoid too much memory use?
+        # store actions that result in a terminal state in a set:
+        self.terminal_actions: set = set()
+
+        # numpy arrays pointing to the exploitation and visit counts of the children in self.children:
         self.child_exploitation_scores: Optional[np.ndarray] = None
         self.child_visit_counts: Optional[np.ndarray] = None
-        self.tensor_state: Optional[torch.tensor] = None
 
-        # Node search results:
+        # numpy tensor state, as described in Node function:
+        self.tensor_state: Optional[np.ndarray] = None
+
+        # number of times this node has been touched by search tree
         self.visit_count: int = 0
+
+        # average reward from children explored downstream of this node:
         self.accrued_reward: float = 0.0
 
         # NN prediction of current state value:
         self.value_score: Optional[float] = None
 
-        # For look ahead, must initially store full policy, as only upon expansion can the full policy be
-        # restricted to the legal restricted move set:
+        # NN full policy, before restriction:
         self.full_policy: Optional[np.ndarray[np.double]] = None
+
+        # After game is populated, policy is restricted to legal moves:
         self.policy_vector: Optional[np.ndarray[np.double]] = None
 
         # flag so that random trees remember to assign the children and so on correctly.
         self.is_assigned_actions = False
 
+        # flag for inference provided or not:
+        self.is_inference_assigned = False
+
     def populate_attributes(self) -> None:
-        """ once a game is created, populate the various attributes:
-        NOTE that it should ALREADY HAVE a tensor state by here!
+        """ Only after a game has been created can certain attributes be populated.
+        Note that a Node should always have a tensor state by this point.
         """
         if not self.game:
-            raise ValueError("You should have a game if you are populating attributes...")
+            raise ValueError("A game is necessary to populate attributes.")
 
         self.result = self.game.result
 
+        # if game is terminal, no need for further attributes:
         if self.result is not None:
             return
 
-        self.assign_actions_and_policy()
+        self.assign_actions()
+
+        # flag to assert that the attributes in this function have been populated:
         self.is_assigned_actions = True
+
+        # Once the actions have been assigned, the policy can be restricted:
+        restricted_policy = self.full_policy[self.possible_actions]
+        self.policy_vector = self.numpy_softmax(restricted_policy)
 
         # MCTS attributes: note that possible actions already restricted above.
         arr_size = len(self.possible_actions)
         self.child_exploitation_scores = np.array([np.inf] * arr_size, dtype=float)
         self.child_visit_counts = np.ones(arr_size, dtype=int)
-        # self.create_tensor_state()
 
-    def assign_actions_and_policy(self) -> None:
-        """ check whether the full policy is assigned yet, if it is, restrict to legal actions,
-        and if there are breadth restrictions in place, restrict the action space.
+    def assign_actions(self) -> None:
+        """ Populate the actions from the assigned game and according to the top and random
+        breadth restrictions. Use these actions to restrict the full policy to "legal" moves.
         """
         # the full policy should always have been assigned:
         if self.full_policy is None:
-            raise ValueError(" The full policy should have been assigned before these attributes "
-                             "are assigned")
+            raise ValueError("The full policy should already have been assigned")
 
-        # all the legal actions that can be played, without restriction:
+        # All the legal actions that can be played, before breadth restrictions:
         game_actions = self.game.get_actions()
 
-        # Ensure that a terminal action is never restricted, as it is vital that these are always explored:
-        terminal_actions = [_action for _action in game_actions if self.game.is_action_terminal(_action)]
+        # Terminal actions are never restricted, as it is vital that these are always explored:
+        self.terminal_actions = {_action for _action in game_actions if self.game.is_action_terminal(_action)}
 
         # restrict the full policy to legal actions only:
         restricted_policy = self.full_policy[game_actions]
 
         # If legal action space sufficiently small, do not restrict further:
-        if len(game_actions) <= (self.breadth_restriction + self.random_restriction):
-            self.policy_vector = self.numpy_softmax(restricted_policy)
+        if len(game_actions) <= (self.restrict_topn + self.restrict_randm):
             self.possible_actions = game_actions
             return
 
         # sort actions according to the policy prior, to give the top n actions:
-        sorted_arguments = np.argsort(restricted_policy)
+        sorted_arguments = np.argsort(-restricted_policy)
 
         # select the top n best, according to the breadth restriction:
-        topn_actions = [game_actions[_arg] for _arg in sorted_arguments[:self.breadth_restriction]]
+        topn_actions = {game_actions[_arg] for _arg in sorted_arguments[:self.restrict_topn]}
 
         # select further actions randomly:
-        remaining_args = sorted_arguments[self.breadth_restriction:]
+        remaining_args = sorted_arguments[self.restrict_topn:]
         np.random.shuffle(remaining_args)
-        random_actions = [game_actions[_arg] for _arg in remaining_args[:self.random_restriction]]
+        random_actions = {game_actions[_arg] for _arg in remaining_args[:self.restrict_randm]}
 
-        # make sure to add the terminal actions back in, no matter what!
-        self.possible_actions = list(set(topn_actions + random_actions) | set(terminal_actions))
-
-        # first restrict policy vector to the *legal actions*:
-        self.policy_vector = self.numpy_softmax(self.full_policy[self.possible_actions])
+        # Re-introduce any terminal actions that were removed:
+        self.possible_actions = list(topn_actions | random_actions | self.terminal_actions)
 
     def calculate_reward(self) -> float:
-        """ If game is terminal, return result, else return the value judgement of the network
-         1  => active player is winning/ won
-        -1  => active player is losing/ lost
+        """ If game is terminal, return result, else return the value judgement of the network from
+        the perspective of the active player.
         """
         # If the result is not None, the game is terminal and the reward is known:
         if self.result is not None:
@@ -212,7 +210,7 @@ class Node:
         return self.value_score
 
     def calculate_exploitation_score(self) -> float:
-        """ the average result of a game passing through this node, normalized by the visit count.
+        """ Either the known result if terminal or the average reward for downstream nodes.
         """
         if self.result is not None:
             return self.result
@@ -221,16 +219,21 @@ class Node:
 
     def calculate_child_exploration_scores(self) -> np.ndarray[float]:
         """ the exploration scores for a single node, a variation on puct scores:
+
+        TODO:
+        Consider alternative scaling for puct score,
+        Consider entropic steering to avoid deleterious overconfidence,
+
+        TODO:
+        can we save this and just update the single entry that changes? if we remove visit count that is
+
+        visit count applied to everything just the same...
         """
-        # todo understand the scaling of this better: sqrt on top feels off:
-        # todo consider whether it is prudent to introduce some entropic steering of the policy vector?
-        # to avoid collapse here? We want the policy vector to really favor some moves, we don't want it to prevent
-        # all exploration...
         return self.policy_vector * (self.visit_count ** 0.5) / self.child_visit_counts
 
     @staticmethod
     def numpy_softmax(logits: np.ndarray[float]) -> np.ndarray[float]:
-        """ numpy implementation given the slowness of torch tensors for allocation
+        """ numpy implementation of softmax:
         """
         exp_demaxed_logits = np.exp(logits - np.max(logits))
         return exp_demaxed_logits / exp_demaxed_logits.sum()
@@ -238,7 +241,7 @@ class Node:
     def expand(self) -> Self:
         """ expand this node by creating and assigning child nodes:
         """
-        # If the leaf state is terminal, do not expand. Note that terminal states never require a game.
+        # If the leaf state is terminal, do not expand. Terminal states never require a game.
         if self.result is not None:
             return self
 
@@ -246,11 +249,11 @@ class Node:
         if len(self.children) > 0:
             return self
 
-        # 1st visit, create a tensor state only, based on parent:
+        # Upon first visit, create a tensor state from the parent tensor state:
         if self.visit_count == 0:
             return self
 
-        # 2nd visit, create own game if one doesn't exist and populate attributes:
+        # On second visit, create own game if one doesn't exist and populate attributes:
         if not self.game:
             self.game = Patterns(self.parent.game)
             action = self.parent.possible_actions[self.parent_action_arg]
@@ -259,27 +262,25 @@ class Node:
         return self.populate_attributes_and_assign_children()
 
     def populate_attributes_and_assign_children(self) -> Self:
-        """ after 2nd visit, populate all the attributes and then return a random child
+        """ After a node gains a game, populate the action attributes and assign children:
         """
         self.populate_attributes()
 
         # Games are populated only with a parent action argument and a parent to minimize copy time:
-        for _it, _move in enumerate(self.possible_actions):
+        for _it, _action in enumerate(self.possible_actions):
             new_node = Node(
                 parent=self,
                 parent_action_arg=_it,
                 depth = self.depth + 1,
-                breadth_restriction=self.breadth_restriction,
-                random_restriction=self.random_restriction,
+                restrict_topn=self.restrict_topn,
+                restrict_randm=self.restrict_randm,
             )
 
-            # Detect games where the _move will result in a terminal state:
-            # IMPORTANT: if a move results in a terminal step, the PLAYER WILL NOT SWAP!
-            # therefore, do not view -1 as a win or 1 as a loss...
-            if self.game.is_action_terminal(_move):
-                # To determine win, loss or draw, we must create a game:
+            # Note: player does not swap for terminal state.
+            if _action in self.terminal_actions:
+                # Create game to determine terminal state:
                 terminal_game = Patterns(self.game)
-                terminal_game.step(_move)
+                terminal_game.step(_action)
                 new_node.result = terminal_game.result
 
                 # As the player is not swapped after a terminal action, 1 is win, -1 is loss:
@@ -291,9 +292,10 @@ class Node:
                 elif new_node.result == -1:
                     self.losing_action_arguments.append(_it)
 
+            # store the children to correspond to the possible actions:
             self.children.append(new_node)
 
-        # return a random choice from the restricted/ legal actions:
+        # return a random child for the second expansion:
         return random.choice(self.children)
 
     def get_state_attributes(self) -> tuple:
@@ -361,6 +363,27 @@ class Node:
         return (board, active_order, passive_order, active_token, passive_token, game.is_no_more_placing,
                 active_color_groups, passive_color_groups)
 
+    def create_tensor_state_from_parent(self) -> np.ndarray: #-> torch.tensor:
+        """ Create this nodes tensor state through the parent tensor state and the parent action.
+        Swap all active and passive layers, then correct the entries for passive.
+        (board, score, bowl token, color order, bowl token value, is no placing)
+        """
+        parent_tensor = self.parent.tensor_state
+        parent_action = self.parent.possible_actions[self.parent_action_arg]
+
+        ### Permute parent tensor to swap active and passive slices:
+        numpy_state = np.array(parent_tensor)[SWAP_ACTIVE_PASSIVE_INDEX]
+
+        # Update each of the types of tensor slice in turn:
+        self._tensor_update_no_more_placing(numpy_state, parent_action)
+        self._tensor_update_board(numpy_state, parent_action)
+        self._tensor_update_bowl_tokens(numpy_state, parent_action)
+        self._tensor_update_color_order(numpy_state, parent_action)
+        self._tensor_update_score(numpy_state, parent_action)
+        self._tensor_update_bowl_token_values(numpy_state, parent_action)
+
+        return numpy_state
+
     def _tensor_update_no_more_placing(self, numpy_state: np.ndarray, parent_action: int) -> None:
         """ correct the flag for no more placing:
         """
@@ -387,33 +410,20 @@ class Node:
 
         ### remove the unflipped in all cases:
         numpy_state[board_color][coords] = 0
-
-        ### if placing action:
-        if parent_action < 52:
-            ### update the board according to the previously active bowl token:
-            numpy_state[12 +  game.active_bowl_token][coords] = 1
-
-        ### if flipping action:
-        else:
-            ### update the board:
-            numpy_state[12 + board_color][coords] = 1
+        col = game.active_bowl_token if parent_action < 52 else board_color
+        numpy_state[12 + col][coords] = 1
 
     def _tensor_update_bowl_tokens(self, numpy_state: np.ndarray, parent_action: int) -> None:
         """ update the child tensor to account for new passive bowl tokens:
         Note that 104 always means the active player takes 0 and 105 always means that the active player takes
         1
         """
-        if parent_action == 104: # active player takes color 0, so passive child takes color 1
-            numpy_state[[30]] = 0
-            numpy_state[[31]] = 1
-            numpy_state[[36]] = 1
-            numpy_state[[37]] = 0
+        if parent_action in [104, 105]:
+            inds = [30, 31, 36, 37]
+            vals = [0, 1, 1, 0] if parent_action == 104 else [1, 0, 0, 1]
 
-        if parent_action == 105: # active player takes color 1
-            numpy_state[[30]] = 1
-            numpy_state[[31]] = 0
-            numpy_state[[36]] = 0
-            numpy_state[[37]] = 1
+            for _ind, _val in zip(inds, vals):
+                numpy_state[_ind] = _val
 
         if parent_action < 52:
             location = parent_action % 52
@@ -501,27 +511,6 @@ class Node:
 
         numpy_state[46] = bowl_token_value / 6.0
 
-    def create_tensor_state_from_parent(self) -> torch.tensor:
-        """ use the parent action and the parent torch tensor to avoid creating new tensors:
-        swap all active and passive layers, then correct the entries for passive:
-        (board, score, bowl token, color order, bowl token value, is no placing)
-        """
-        parent_tensor = self.parent.tensor_state
-        parent_action = self.parent.possible_actions[self.parent_action_arg]
-
-        ### First, permute the whole tensor to swap all active and passive:
-        numpy_state = parent_tensor.numpy()[PERM_INDEX]
-
-        # update each of the types of tensor slice in turn:
-        self._tensor_update_no_more_placing(numpy_state, parent_action)
-        self._tensor_update_board(numpy_state, parent_action)
-        self._tensor_update_bowl_tokens(numpy_state, parent_action)
-        self._tensor_update_color_order(numpy_state, parent_action)
-        self._tensor_update_score(numpy_state, parent_action)
-        self._tensor_update_bowl_token_values(numpy_state, parent_action)
-
-        return torch.tensor(numpy_state)
-
     def create_tensor_state(self) -> None:
         """ Ideally tensor state would be cheaply made by copying the previous tensor state
 
@@ -547,15 +536,17 @@ class Node:
 
         We adapt the tensor to key from the previous TENSOR not from the previous state.
         """
+        # No-op if the tensor state has already been created:
         if self.tensor_state is not None:
             return
 
+        # if the node has a parent, that parent should have a tensor state:
         if self.parent:
             if self.parent.tensor_state is not None:
                 self.tensor_state = self.create_tensor_state_from_parent()
                 return
 
-        # If no parent tensor state exists, instead use the details from the state attribuites:
+        # If no parent tensor state exists, instead use the details from the state attributes:
         board, aorder, porder, atoken, ptoken, place_bool, acolgroups, pcolgroups = self.get_state_attributes()
 
         ### Board tensor:
@@ -603,18 +594,8 @@ class Node:
 
         ### Stack the tensors:
         self.tensor_state = torch.cat([board_tensor, order_tensor, bowl_tensor, placing_tensor,
-                                       score_tensor, token_value_tensor], dim=0)
+                                       score_tensor, token_value_tensor], dim=0).numpy()
 
-    def get_replay_state(self) -> tuple:
-        """ returns everything needed to create the game state from this node, for use in the replay buffer
-        """
-        _g = self.game
-        return (_g.active_board,
-                _g.active_color_order,
-                _g.passive_color_order,
-                _g.active_bowl_token,
-                _g.passive_bowl_token
-                )
 
 class Tree:
     """ Search tree functions, as most nodes will never need to access these.
@@ -627,33 +608,35 @@ class Tree:
                  puct_constant: float = 2.0 ** 0.5,
 
                  # parameters for restricting breadth of search:
-                 breadth_restriction: Optional[int] = 4,
-                 random_restriction: Optional[int] = 4,
+                 restrict_topn: Optional[int] = 4,
+                 restrict_randm: Optional[int] = 4,
 
                  # schedule for explorations steps scaling with tree depth:
                  schedule: Optional[list[tuple]] = None,
                  ) -> None:
 
-        # the game and the root node of the search tree
+        # Create a root node if none is supplied:
         if root_node is None:
             game = Patterns()
             root_node = Node(
                 game=game,
-                breadth_restriction=breadth_restriction,
-                random_restriction=random_restriction
+                restrict_topn=restrict_topn,
+                restrict_randm=restrict_randm
             )
 
         self.root_node = root_node
 
         # rather than marching up through the nodes using .parent, we store the path to leaf
-        self._path_nodes = []
+        self._traversed_path = []
 
-        self.breadth_restriction = breadth_restriction
-        self.random_restriction = random_restriction
+        # breadth restriction parameters:
+        self.restrict_topn = restrict_topn
+        self.restrict_randm = restrict_randm
 
+        # string reference for the search tree:
         self.tree_id = tree_id
 
-        # noise property only added to root node exploration:
+        # noise property:
         self._noise = None
 
         # Constants:
@@ -661,39 +644,61 @@ class Tree:
         self.dirichlet_noise_level = dirichlet_noise_level
         self.dirichlet_noise_epsilon = dirichlet_noise_epsilon
 
-        # tree-level flag that dictates when a tree is done exploring and wishes to move on
+        # Flag set to True when search tree has explored sufficiently many nodes and is ready to step root node:
         self.is_step_ready = False
 
         # save the schedule to pass down to the next root nodes, use it to determine the required exploration steps
-        self.schedule = schedule
+        self.schedule = schedule or [(0, 100)] # default of 100 exploration steps
         self.root_node_explore_count: int = 0
-        self.required_steps: int = 0
+        self._required_steps: Optional[int] = None
 
-        self.determine_required_steps()
+        # save a replay buffer for each game started:
+        self.replay_buffer: list = []
 
     def reset(self, root_node: Optional[Node] = None) -> None:
         """ take the tree back to the initial position:
         """
-        if not root_node:
+        if root_node is None:
             new_game = Patterns()
-            root_node = Node(game=new_game)
+            root_node = Node(
+                game=new_game,
+                restrict_topn=self.restrict_topn,
+                restrict_randm=self.restrict_randm,
+            )
 
         self.root_node = root_node
         self.root_node_explore_count = 0
 
-        # and reset the noise:
+        # Reset correlated dirichlet root node noise:
         self._noise = None
 
-        # set the required exploration steps again, according to the same schedule:
-        self.determine_required_steps()
+        # reset the flag for root node stepping:
+        self.is_step_ready = False
 
-    def determine_required_steps(self) -> None:
+        # Reset the required steps property:
+        self._required_steps = None
+
+        # Reset the replay buffer:
+        self.replay_buffer = []
+
+    @property
+    def required_steps(self) -> int:
+        """ use the schedule to determine how many explore steps are required for the root node.
+        """
+        if self._required_steps is None:
+            self.set_required_steps()
+
+        return self._required_steps
+
+    def set_required_steps(self) -> None:
         """ use the schedule to determine how many root node explores this node should have:
 
         Schedule always starts with (0, X) to state that there are X required steps at depth 0
 
         Then either there is no other tuple, in which case all root nodes explore for X, or there are
         other schedules, and as soon as your depth is below the first entry, you take the previous
+
+        Note we assume that schedule is strictly sorted in the first argument.
         """
         curr_explore = self.schedule[0][1]
 
@@ -703,7 +708,7 @@ class Tree:
 
             curr_explore = _steps
 
-        self.required_steps = curr_explore
+        self._required_steps = curr_explore
 
     @property
     def noise(self) -> np.ndarray[float]:
@@ -733,9 +738,8 @@ class Tree:
     def choose_action_argument(self, temperature: Optional[float] = None) -> int:
         """ Sample from the child actions vector according to the distribution formed from child visit counts:
         """
+        # If the game is played randomly, the node will not have been expanded correctly and actions will not be assigned
         if not self.root_node.possible_actions:
-            # This indicated that we have arrived here in a random game where this node has
-            # not been expanded correctly. We need to assign the actions
             if not self.root_node.is_assigned_actions:
                 # If the root node has not expanded fully yet, complete here:
                 _ = self.root_node.populate_attributes_and_assign_children()
@@ -743,27 +747,25 @@ class Tree:
             else:
                 raise ValueError("The game has no valid actions, and should have ended...")
 
-        # If there is a winning move, the tree should take that action:
+        # If there are winning moves, return one at random:
         if self.root_node.winning_action_arguments:
             return np.random.choice(self.root_node.winning_action_arguments)
 
-        # If there are any non-losing moves, mask out 1-move losses:
-        if len(self.root_node.losing_action_arguments) < len(self.root_node.possible_actions):
-            # remove losing arguments from the list:
-            okay_arguments = list(set(range(len(self.root_node.possible_actions)))
-                                  - set(self.root_node.losing_action_arguments))
-
-        else:
-            # if no choice, just return a random loss:
+        # If there are ONLY losing moves, return one at random:
+        if len(self.root_node.losing_action_arguments) >= len(self.root_node.possible_actions):
             return random.choice(self.root_node.losing_action_arguments)
 
-        # if choosing randomly:
+        # If there are any non-losing moves, mask out 1-move losses:
+        okay_arguments = list(set(range(len(self.root_node.possible_actions)))
+                              - set(self.root_node.losing_action_arguments))
+
+        # Playing randomly:
         if self.required_steps == 0:
             return random.choice(okay_arguments)
 
         filtered_visit_counts = self.root_node.child_visit_counts[okay_arguments]
 
-        # sample an action randomly according to visit counts:
+        # Sample from the visit count distribution, according to temperature parameter:
         if temperature is not None:
             selection_scores = filtered_visit_counts ** (1.0 / temperature)
             selection_scores /= selection_scores.sum()
@@ -774,50 +776,67 @@ class Tree:
         return okay_arguments[_argmax]
 
     def step(self, action_argument: int) -> None:
-        """ Progress the tree according to the action argument.
+        """ Step root node to selected child, according to action_argument.
 
-        We increment the visit count and create a game if there isn't one, as we never need to backprop this.
+        Reset properties, and populate game if necessary.
 
         Note that when a tree is taking RANDOM moves, it will be moving to
         a child that has not been visited or seen before. These children will not have
         tensor states, values or policies assigned.
 
+        Delete the root node, but store the necessary attributes in the replay buffer, in particular the
+        tensor state, the visit counts etc.
         """
-        # create new game for new root:
-        game = Patterns(self.root_node.game)
-        action = self.root_node.possible_actions[action_argument]
-        game.step(action)
+        # Before progressing, store the necessary replay information from the root node:
+        self.store_replay()
 
-        # step to new root node, taking the action selected:
-        self.root_node = self.root_node.children[action_argument]
-        self.root_node.game = game
+        # the target to become the new root node:
+        chosen_child = self.root_node.children[action_argument]
+
+        # only create a new game if one is not already there:
+        if chosen_child.game is None:
+            # create new game for new root:
+            game = Patterns(self.root_node.game)
+            action = self.root_node.possible_actions[action_argument]
+            game.step(action)
+
+            # and assign to the child:
+            chosen_child.game = game
+
+        self.root_node = chosen_child
         self.root_node_explore_count = self.root_node.visit_count
 
         # reset the dirichlet noise:
         self._noise = None
 
         # check the schedule again after stepping:
-        self.determine_required_steps()
+        self._required_steps = None
         self.is_step_ready = False
 
         # if the root node requires random moving, set the full policy to be random
         if self.required_steps == 0:
-            self.root_node.full_policy = np.random.rand(107)
+            self.root_node.full_policy = np.random.rand(107) # 107 actions total:
             self.root_node.value_score = -1. + 2. * np.random.rand()
 
-    def get_leaf_node(self) -> Node:
-        """ flow from the root node to an unexpanded leaf node, following the highest puct score:
+        # Tensor state is created from parent tensor state, so create this before discarding parent:
+        self.root_node.create_tensor_state()
 
-        If a winning argument is presented, it is taken,
-        If a losing argument is not necessary, it is not taken.
+        # Kill the top of the tree to save memory:
+        self.root_node.parent = None
+
+    def get_leaf_node(self) -> Node:
+        """ Flow from the root node to an unexpanded leaf node, following the highest puct score:
+
+        If node ever possesses winning arguments, one is taken and the leaf is terminal.
+
+        If possible, nodes will always avoid losing arguments.
         """
-        # increment the root node EXPLORE count.
         self.root_node_explore_count += 1
 
         # start the path at the root node:
-        self._path_nodes.append(self.root_node)
+        self._traversed_path.append(self.root_node)
 
-        # if enough exploration steps have been taken, prepare to step the root node:
+        # if sufficiently many exploration steps have been taken, prepare to step the root node:
         if self.root_node_explore_count >= self.required_steps:
             self.is_step_ready = True
 
@@ -836,7 +855,7 @@ class Tree:
         while node.children:
             node = self.next_node(node)
             # store the path taken to flow to leaf:
-            self._path_nodes.append(node)
+            self._traversed_path.append(node)
 
         return node
 
@@ -873,7 +892,12 @@ class Tree:
 
     def calculate_child_puct_scores(self, node: Node) -> np.ndarray[float]:
         """ determine whether the node is the root node or not, and return the puct scores
-        accordingly
+        accordingly.
+
+        Puct score is exploitation + puct constant * exploration scores.
+
+        Exploitation is set to +inf initially, so that until a node is visited and the score corrected,
+        unexplored nodes will be prioritised.
         """
         exploration_scores = node.calculate_child_exploration_scores()
         exploitation_scores = node.child_exploitation_scores
@@ -888,363 +912,70 @@ class Tree:
     @staticmethod
     def update_parent_child_scores(node: Node) -> None:
         """ Update the child scores for the parent of the node argument.
-
-        Note that the child visit counts of zero would result in a NaN value.
-        Therefore, this is initialized to 1, and the understanding is that the
-        addition for child puct scores will grant the necessary inf value
         """
         if node.parent is None:
             return
 
         parent = node.parent
+        parent_action_arg = node.parent_action_arg
 
-        # exploitation score is the result if terminal or the average reward otherwise (accrued reward / n):
-        parent.child_exploitation_scores[node.parent_action_arg] = -node.calculate_exploitation_score()
-        parent.child_visit_counts[node.parent_action_arg] = node.visit_count
+        # exploitation score is the result if terminal or the average reward otherwise (accrued reward / visit count)
+        # negated for zero sum 2 player game with alternating turns:
+        parent.child_exploitation_scores[parent_action_arg] = -node.calculate_exploitation_score()
 
-    def back_propagate(self) -> None: #, node: Node) -> None:
-        """ push the result of the leaf node rollout up the tree to the root node,
+        # child visit counts are initialized to 1 to avoid divide by zero errors:
+        parent.child_visit_counts[parent_action_arg] = node.visit_count
+
+    def back_propagate(self) -> None:
+        """ Push the leaf node rewards back up the tree to the root node,
         updating the reward and visit counts of the nodes on this path.
         """
-        reward = self._path_nodes[-1].calculate_reward()
+        # either result for terminal or value judgement for the leaf node:
+        reward = self._traversed_path[-1].calculate_reward()
 
         # if the final node is terminal, we do not want to switch the game and game reward:
-        if self._path_nodes[-1].result is not None:
+        if self._traversed_path[-1].result is not None:
 
             # no need to do accrued reward for a terminal node:
-            self._path_nodes[-1].visit_count += 1
+            self._traversed_path[-1].visit_count += 1
 
-            # and skip this node:
-            self._path_nodes.pop()
+            # and skip this node as the player will not switch after a terminal move:
+            self._traversed_path.pop()
 
-        # now iterate over the path, alternating the reward.
-        for _node in self._path_nodes[::-1]:
+        # Iterate over the root-to_leaf path, alternating the reward:
+        for _node in reversed(self._traversed_path):
             _node.visit_count += 1
-            _node.accrued_reward += 1
+            _node.accrued_reward += reward # reward for a leaf node starts off as the NN judgement.
             self.update_parent_child_scores(_node)
-            reward = -reward
+            reward = -reward # flip reward for opposing players:
 
-        # after iterating, reset the list:
-        self._path_nodes = []
+        # after iterating, reset the exploration path:
+        self._traversed_path = []
 
-
-        # for _node in self._path_nodes[::-1]:
-        #
-        # node = self._path_nodes.pop()
-        #
-        # # Reward is the result if terminal else the active player value judgement of the network:
-        # reward = node.calculate_reward()
-        #
-        # # If the node was terminal, jump to parent first and march up from there.
-        # if node.result is not None:
-        #     # Note : If there is a terminal action from a given node (one identified as ending the game) then the game
-        #     # after the move will have the SAME PLAYER as the current player.
-        #     node.visit_count += 1
-        #     # node = node.parent
-        #
-        #     # also remove the last node:
-        #     self._path_nodes.pop()
-        #
-        # ### we change to use the internal list of nodes to assign the reward
-        # for _node in self._path_nodes[::-1]:
-        #     _node.accrued_reward += reward
-        #     _node.visit_count += 1
-        #     self.update_parent_child_scores(_node)
-        #     reward = -reward
-
-        # # stop once you reach and update the root node, ie when the node is now the parent of the root node.
-        # while node is not self.root_node.parent:
-        #     # increment the reward and the visit count:
-        #     node.accrued_reward += reward
-        #     node.visit_count += 1
-        #
-        #     # Update the nodes view of the children, including of the winning and losing actions:
-        #     self.update_parent_child_scores(node)
-        #
-        #     # Step to parent and flip the reward:
-        #     node = node.parent
-        #     reward = -reward
-
-    def get_replay_game(self,
-                        save_depth: Optional[int],
-                        is_save_nodes: bool=False) -> tuple[list[tuple], int]:
-        """ Once the root node is in a terminal state, store the various states for use in the replay buffer:
-        Note that terminal states do not create games, so we must first step up to parent.
-
-        Save depth tells you how far from terminal state to bother saving. At early training, we wouldn't
-        bother training on the very, very weak signal from near the starting position, for example.
-
-        For now, only splitting by win loss draw?  To balance the target of -1, 0, 1.
-        Store the other meta information for later use, and the trainer can choose how to use that data:
-
-        NOTE final result is the result from the point of view of the parent of the root node.
-
-        In particular, the search tree progresses until the root node is in a terminal state
-        THEN it seeks to store the necessary number of replay steps back from this terminal state
-        As we aren't interested in training on the
+    def store_replay(self) -> None:
+        """ Store the necessary information for the replay buffer in the internal replay list.
         """
-        # Recall that after an action is terminal, the player doesn't swap, so the parent of the root node
-        # will have the same result:
-        final_result = self.root_node.result
+        visit_counts = self.get_replay_visit_counts()
+        self.replay_buffer.append( (self.root_node.tensor_state, visit_counts) )
 
-        if final_result is None:
-            raise ValueError("this function should only be called on a completed game!")
+    def get_replay_visit_counts(self) -> np.ndarray:
+        """ The full visit counts array, with boosting for losses and wins
+        """
+        # Full action space:
+        full_visit_counts = np.zeros(107, dtype=int)
+        possible_actions = np.array(self.root_node.possible_actions)
 
-        # start at parent of root to avoid training on terminal states:
-        nod = self.root_node.parent
+        # when saving visit counts, boost winning arguments, minimize losing ones, and make sure all winning arguments
+        # are viewed as equally good!
+        if self.root_node.winning_action_arguments:
+            full_visit_counts[ possible_actions[self.root_node.winning_action_arguments]] = 1
+            return full_visit_counts
 
-        # todo this needs to respect the fact that save depth can exceed turn number?
-        save_len = nod.game.turn_number if save_depth is None else save_depth
+        full_visit_counts[self.root_node.possible_actions] = self.root_node.child_visit_counts
 
-        # the buffer is saved in an ordered tuple - (state tensor, visit counts array, additional information):
-        _replay = []
+        if self.root_node.losing_action_arguments:
+            # Boost all non-losing arguments:
+            full_visit_counts *= 1000
+            full_visit_counts[ possible_actions[self.root_node.losing_action_arguments] ] = 1
 
-        # work backwards up through the tree, storing the states and the visit counts:
-        for _ in range(save_len):
-
-            # if the game contained fewer moves than the save depth, break:
-            if nod is None:
-                break
-
-            # child visit counts - target for policy:
-            full_visit_counts = np.zeros(107, dtype=int)  # full action space
-
-            # when saving visit counts, boost winning arguments, minimize losing ones, and make sure all winning arguments
-            # are viewed as equally good!
-            if nod.winning_action_arguments:
-                for _ in nod.winning_action_arguments:
-                    full_visit_counts[nod.possible_actions[_]] = 1
-
-            # we can minimize the effects of the losing arguments by assigning a minimum value of 1 and boosting all
-            # other legal actions:
-            else:
-                # otherwise, use the visit counts from the search tree:
-                full_visit_counts[nod.possible_actions] = nod.child_visit_counts
-
-                if nod.losing_action_arguments:
-                    # if losing arguments, boost all arguments then down boost the losing ones:
-                    full_visit_counts *= 1000
-
-                    # iterate over losing arguments and set to mimimum value:
-                    for _ in nod.losing_action_arguments:
-                        full_visit_counts[nod.possible_actions[_]] = 1
-
-            # result for this node:
-            nod_result = final_result if nod.active_player == self.root_node.active_player else -1 * final_result
-
-            # number of flipped tokens:
-            flipped_num = len(nod.game.flipped_locations)
-
-            # state, visit counts, additional information:
-            save_list = [nod.tensor_state, full_visit_counts, _, flipped_num, nod_result]
-
-            # additional debug info if required:
-            if is_save_nodes:
-                save_list.append(nod)
-
-            # save to the buffer:
-            _replay.append(tuple(save_list))
-
-            # continue up the tree:
-            nod = nod.parent
-
-        return _replay, final_result
-
-### used to be the way of a node making a tensor state:
-    # def _OLDcreate_tensor_state(self) -> None:
-    #     """ Assign the tensor state that will be read by the agent's NN to provide the value and policy
-    #     values for this node.
-    #
-    #     History is not currently included, but might be in future.
-    #
-    #     Tensor state is a 8 x 8 x (6x3 + 6x6 + 6x6 + 2x6) binary tensor.
-    #
-    #     The first 6x3 planes represent the board itself, with planes 0-5 denoting the presence of an unflipped token
-    #     of that color, 6-11 representing flipped for active player of that color, and 12-17 flipped for passive player.
-    #
-    #     This matches the numpy array, one-hot-encoded.
-    #
-    #     The next 2 x 6 x 6 planes represent the color group order taken, for each player.
-    #
-    #     In particular, these planes are constant 1 or constant 0.
-    #     Planes 0-5 represent the order at which color 0 was taken for the active player
-    #     Planes 6-11 represent the order at which color 1 was taken for the active player etc.
-    #
-    #     Planes 36 - 41 represent the order at which color 0 was taken for the passive player.
-    #     Planes 42 - 47 represent the order at which color 1 was taken for the passive player etc.
-    #
-    #     The next 12 planes represent the color of the bowl token for the active player (0-5) and the
-    #     passive player (6-11).
-    #
-    #     Finally, we include a plane that dictates whether or not there is any more placing:
-    #     """
-    #     if self.tensor_state is not None:
-    #         return
-    #
-    #     board, aorder, porder, atoken, ptoken, place_bool, acolgroups, pcolgroups = self.get_state_attributes()
-    #
-    #     # the board is just a one hot encoded version of the numpy board. value 18 (19th class) is board corners.
-    #     board_tensor = torch.nn.functional.one_hot(board.long(), num_classes=19)[:, :, :-1]
-    #
-    #     # 36 channels for each player for color group: order mapping:
-    #     order_tensor = torch.zeros((8, 8, 72), dtype=bool)
-    #     order_indices = [_x - 1 + 6 * _it for _it, _x in enumerate(aorder + porder) if _x > 0]
-    #     order_tensor[:, :, order_indices] = 1
-    #
-    #     # bowl tokens: 12 additional channels.
-    #     bowl_tensor = torch.zeros((8, 8, 12), dtype=bool)
-    #     bowl_tensor[:, :, atoken] = 1
-    #     bowl_tensor[:, :, 6 + ptoken] = 1
-    #
-    #     # is no more placing:
-    #     placing_tensor = torch.ones((8, 8, 1), dtype=bool) if place_bool else torch.zeros((8, 8, 1), dtype=bool)
-    #
-    #     # stack the three tensors together:
-    #     concat_tensor = torch.cat([board_tensor, order_tensor, bowl_tensor, placing_tensor], dim=-1)
-    #
-    #     # and put channels first, for CNN:
-    #     self.tensor_state = concat_tensor.permute(2, 0, 1)
-    #
-    #     ### no longer necessary as corners set to value 18 and removed in 1 hot:
-    #     # remove the corners:
-    #     # self.remove_tensor_corners(self.tensor_state)
-    #
-    # # def remove_tensor_corners(self, board: torch.tensor) -> None:
-    # #     """ one hot encoding will give class values to the corners. Remove them
-    # #     """
-    # #     iinds = [0] * 12
-    # #     jinds = [0, 0, 1, 7, 6, 7, 0, 1, 0, 7, 7, 6]
-    # #     kinds = [0, 1, 0, 7, 7, 6, 7, 7, 6, 0, 1, 0]
-    # #     board[iinds, jinds, kinds] = 0
-
-
-# # todo check this can be removed? Already checking for terminal actions which should provide the result:
-# # in particular, new nodes are populated with a result if the action would be terminal
-# # After game is populated, can detect terminal state and return:
-# if self.result is not None:
-#     return self
-#
-#     def OLDcreate_tensor_state(self) -> None:
-#         """ Adaptation from original idea.
-#
-#         Rather than 72 planes (6 colors by 6 orders by 2 players) we reduce this to 12 float layers (6 colors by
-#         2 players).
-#
-#         Here, the value is normalized for the order in which it was taken (0 - 6).
-#
-#         We further add in score, which is the current score for the active player in this state. That is,
-#         order * number taken
-#
-#         The final number of layers is then:
-#
-#         18 for pieces (board) BOOL
-#         12 for orders FLOAT
-#         12 for bowl tokens BOOL
-#         2 for score FLOAT
-#         2 for current bowl token value
-#         1 for is no more placing BOOL
-#
-#         = 47 layers instead of the 108 or whatever above. Further, the order actually makes SENSE to be increasing. It
-#         isn't just representing a different class.
-#
-#         Note we can also, long term, introduce move history, the redundancy of which might be useful.
-#         """
-#         if self.tensor_state is not None:
-#             return
-#
-#         board, aorder, porder, atoken, ptoken, place_bool, acolgroups, pcolgroups = self.get_state_attributes()
-#
-#         # the board is just a one hot encoded version of the numpy board. value 18 (19th class) is board corners.
-#         # board_tensor = torch.nn.functional.one_hot(
-#         #     torch.tensor(board).long(), num_classes=19)[:, :, :-1]
-#         board_tensor = EYE.index_select(1, torch.tensor(board).long().flatten())  # shape (18, 64)
-#         board_tensor = board_tensor.view(18, 8, 8)  # now in (C, H, W)
-#
-#         # 6 channels for each player, floats as floats are meaningful for order:
-#         # order_tensor = torch.zeros((8, 8, 12), dtype=torch.float)
-#
-#         # order_values = torch.tensor(aorder + porder, dtype=torch.float) / 6.0 # normalize to between 0.0 and 1.0:
-#         # order_tensor[:, :, range(12)] = order_values
-#
-#         order_list = [_or / 6.0 for _or in aorder + porder]
-#         order_tensor = torch.tensor(order_list).view(12, 1, 1).expand(12, 8, 8)
-#
-#         # bowl tokens: 12 additional channels.
-#         bowl_tensor = torch.zeros((8, 8, 12), dtype=torch.bool)
-#         bowl_tensor[:, :, atoken] = 1
-#         bowl_tensor[:, :, 6 + ptoken] = 1
-#
-#         # is no more placing:
-#         placing_tensor = torch.tensor([int(place_bool)]).view(1, 1, 1).expand(1, 8, 8)
-#         # placing_tensor = torch.ones((8, 8, 1), dtype=torch.bool) if place_bool else torch.zeros((8, 8, 1), dtype=torch.bool)
-#
-#         # also capture the current score:
-#         # score_tensor = torch.zeros((8, 8, 2), dtype=torch.float)
-#         active_score = 0
-#         passive_score = 0
-#
-#         for _col, (_aorder, _porder) in enumerate(zip(aorder, porder)):
-#             active_score += len(acolgroups[_col]) * _aorder
-#             passive_score += len(pcolgroups[_col]) * _porder
-#
-#         score_tensor = torch.tensor([active_score / 150., passive_score / 150.]).view(2, 1, 1).expand(2, 8, 8)
-#
-#         # score_tensor[:, :, 0] = active_score / 150.
-#         # score_tensor[:, :, 1] = passive_score / 150.
-#
-#         # additional redundant information that may help: the current value of the token in hand:
-#         token_value_tensor = torch.zeros((8, 8, 2), dtype=torch.float)
-#
-#         # determine the placing numbers:
-#         apnum, ppnum = 1, 1
-#
-#         for _col, (_a, _p) in enumerate(zip(aorder, porder)):
-#             # increment for each time a color has been taken:
-#             if _a > 0:
-#                 apnum += 1
-#
-#             if _p > 0:
-#                 ppnum += 1
-#
-#         active_value = aorder[atoken] if aorder[atoken] != 0 else apnum
-#         passive_value = porder[ptoken] if porder[ptoken] != 0 else ppnum
-#
-#         token_value_tensor = torch.tensor([active_value / 6.0, passive_value / 6.0]).view(2, 1, 1).expand(2, 8, 8)
-#
-#         # token_value_tensor[:, :, 0] = active_value / 6.0
-#         # token_value_tensor[:, :, 1] = passive_value / 6.0
-#
-#         # stack the three tensors together:
-#         self.tensor_state = torch.cat([board_tensor, order_tensor, bowl_tensor, placing_tensor, score_tensor,
-#                                        token_value_tensor], dim=0)
-#
-#         # # and put channels first, for CNN:
-#         # self.tensor_state = concat_tensor.permute(2, 0, 1)
-
-
- #
- # def next_node(self, node: Node) -> Node:
- #        """ get the next node in order, avoiding 1 move losses if possible and taking 1 move wins:
- #        Follow the best puct score.
- #        """
- #        # Step to a winning node if possible:
- #        if node.winning_action_arguments:
- #            arg = random.choice(node.winning_action_arguments)
- #            return node.children[arg]
- #
- #        # If there are any non-losing moves, mask out 1-move losses:
- #        if len(node.losing_action_arguments) < len(node.possible_actions):
- #            # calculate the puct scores:
- #            puct_scores = self.calculate_child_puct_scores(node)
- #
- #            # determine which arguments are losing:
- #            not_loss_args = list(set(range(len(node.possible_actions))) - set(node.losing_action_arguments))
- #
- #            # mask out the losing puct scores, and choose the best remaining:
- #            filtered_puct = puct_scores[not_loss_args]
- #            _argmax = np.argmax(filtered_puct)
- #
- #            return node.children[not_loss_args[np.argmax(filtered_puct)]]
- #
- #        # if no choice, just return a random child:
- #        return random.choice(node.children)
+        return full_visit_counts
