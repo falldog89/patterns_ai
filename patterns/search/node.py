@@ -27,8 +27,8 @@ import numpy as np
 import random
 from typing import Optional, Self
 
-from game import Patterns
-import state
+from patterns.game import Patterns
+from patterns.search import state
 
 
 class Node:
@@ -296,4 +296,4 @@ class Node:
         parent_action = self.parent.possible_actions[self.parent_action_arg]
 
         self.state = state.create_state_from_parent_game(self.parent.game,
-                                                                  parent_action)
+                                                         parent_action)

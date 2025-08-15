@@ -3,25 +3,30 @@ Game-playing agent for the game of patterns.
 
 Agents manage multiple trees in series, and provision the inference in parallel.
 
-In particular, a single agent will manage a number of search trees.
+The structure is roughly:
 
-These trees will be set to explore, one step at a time. At each step, the leaf node from each
-tree will be stored, ready to receive inference. Any tree that has sufficiently explored will be
-marked as ready to move.
+HEAD - some manager of multiple agents, potentially across many machines. Centralizes the training stage
+ |
+AGENTS: 1 gpu, multiple threads: manage multiple search trees in series, provision inference in parallel batches. Collect
+        completed games and return to the trainer to continually improve the network.
+|
+TREES: MCTS search trees, with root nodes. Undertake search steps which flow to a leaf and then solve horizon problem
+        with NNs trained to recognise valuable states. The same NN guides the search by biasing the prior probability
+        of choosing a branch.
+|
+NODES: the individual nodes of the search tree, managing their own games, states, value, rewards etc.
 
-Then, all inference is carried out in a batch to the agents Network, the results then returned
-to the relevant leaf nodes.
-
-Once sufficient games have been completed, the resulting replay data is stored and the process is terminated.
+todo investigate potential for further vectorization eg in incrementing rewards,
 """
 
 import torch
 import numpy as np
 from typing import Optional
 
-from game import Patterns
-from node import Node
-from tree import Tree
+from patterns.game import Patterns
+
+from patterns.search import Node
+from patterns.search import Tree
 
 
 class Agent:
@@ -31,16 +36,15 @@ class Agent:
                  agent_id: str,
                  network: torch.nn.Module,
                  device: torch.device,
-                 num_trees: int = 20,
-                 target_games: int = 1000,
+                 num_trees: int = 1,
+                 target_games: int = 1,
                  selection_temperature: float = 1.0,
                  restrict_topn: int = 4, # breadth restriction parameters
                  restrict_randm: int = 4,
                  save_depth: Optional[int] = None,
                  explore_steps_schedule: Optional[list[tuple]] = None,
-                 debug: bool = False,
                  ):
-        # unique string for this agent:
+        # unique string to identify this agent:
         self.agent_id = agent_id
 
         # put the network into eval mode, move it to device:
@@ -59,26 +63,27 @@ class Agent:
         self.num_completed = 0
         self.target_games = target_games
 
-        # replay data: (states, visit_counts, final result, distance from terminal)
+        # replay data: (states, visit_counts, final result, distance from terminal state)
         self.replay_data = []
 
-        # exploration breadth statistics:
+        # restrictions placed on search tree breadth, to favor deeper trees over broad ones: see Node.
         self.restrict_topn = restrict_topn
         self.restrict_randm = restrict_randm
 
-        # distance from the terminal node to save to:
+        # Number of states and visit counts prior to terminal to save replay data for;
         self.save_depth = save_depth
+
+        # Schedule for number of explore steps with node depth. Often explore more for deeper nodes..
         self.explore_steps_schedule = explore_steps_schedule
 
         # Create batch of root nodes at instantiation, with batch provisioned inference:
         self.root_nodes: list[Node] = []
         self.create_root_nodes()
 
-        # create the trees and populate with some pre-generated root nodes:
+        # create the trees and populate each with a pre-inferenced root node:
         self.trees = []
 
         for _gameit in range(num_trees):
-            # take a game:
             _root_node = self.root_nodes.pop()
 
             self.trees.append(
@@ -91,7 +96,7 @@ class Agent:
                 )
             )
 
-        self._debug = debug
+        # keep track of the most recent leaf node for debugging:
         self._debug_leaf = None
 
         # internal lists to track Nodes requiring some form of additional action:
@@ -101,18 +106,13 @@ class Agent:
         self.ready_trees = []
 
     def create_root_nodes(self) -> None:
-        """ Create the maximum number of root nodes that might be required (num trees + num target games)
-        in advance in order to take advantage of parallel inference.
+        """ Create the maximum required root nodes in advance, to take advantage of efficient parallel inference:
         """
-
         print(f"Generating initial games:")
         states = []
 
         for _it in range(self.num_trees + self.target_games):
-            # create new game:
             new_game = Patterns()
-
-            # assign new game to root node, along with breadth restriction params:
             new_nod = Node(
                 game=new_game,
                 restrict_topn=self.restrict_topn,
@@ -152,14 +152,14 @@ class Agent:
             _nod.is_inference_assigned = True
 
     def run_games(self) -> None:
-        """ Continually run exploration, inference, back propagation steps until
-        sufficiently many games have been completed
+        """ Continually run exploration, inference and back propagation steps until
+        sufficiently many games have been completed.
         """
         num_completed = 0
 
         # continue until the agent has collected enough games:
         while self.num_completed < self.target_games:
-            # Explore every tree, identify trees requiring inference etc.
+            # Explore every tree in series, track which trees require inference:
             self.explore()
 
             # Provision inference to relevant nodes:
@@ -203,7 +203,7 @@ class Agent:
                 self.ready_trees.append(_tree)
 
             if not leaf_node.is_inference_assigned:
-                # create the state for leaf node:
+                # ensure there is a state for inference for this leaf node:
                 leaf_node.ensure_state()
 
                 # track which nodes will require inference results:
@@ -233,7 +233,7 @@ class Agent:
             # value score is normalized in the network to be between -1 and 1:
             _leaf.value_score = _val
 
-            # policy cannot be restricted just yet, as the game action space is not yet known:
+            # policy cannot be restricted until the legal actions are known:
             _leaf.full_policy = _pol
 
             # switch flag for inference:
@@ -252,7 +252,7 @@ class Agent:
                 result = _tree.root_node.result
                 replay_data = _tree.replay_buffer[-self.save_depth:]
 
-                # Save training data as (state, visit counts, final result, distance from terminal state)
+                # (state, visit counts, result for final active player, distance from terminal state):
                 replay_extension = [(_state, _vcs, result, _it + 1)
                                     for _it, (_state, _vcs) in enumerate(reversed(replay_data))]
 

@@ -91,11 +91,10 @@ plan
     
 3. Start playing games from further back
 """
-from mcts.networks import PatternsNet
+from patterns.search.networks import PatternsNet
 import matplotlib.pyplot as plt
 from typing import Optional
 
-from game import Patterns
 from augmentor import StateAugmentor
 
 import torch

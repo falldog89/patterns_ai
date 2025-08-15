@@ -16,7 +16,7 @@ from torch import nn
 import math
 
 
-class PatternsNet(nn.Module):
+class ResNet(nn.Module):
     """ Take in the initial munging of the board and player states, and perform standard resnet
     fun on it:
     """
@@ -26,7 +26,7 @@ class PatternsNet(nn.Module):
                  ) -> None:
         """ 102 in channels for patterns. 18 for color and player, 72 for color group order, 12 for bowl tokens.
          """
-        super(PatternsNet, self).__init__()
+        super(ResNet, self).__init__()
 
         # initial processing layer: output size (samples, out_channels, 8, 8)
         self.input_layer = nn.Sequential(

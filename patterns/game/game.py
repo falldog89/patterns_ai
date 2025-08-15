@@ -45,8 +45,11 @@ import random
 import numpy as np
 from typing import Optional, Self
 
-from constants import orthogonal_neighbors, loci, locj, location_to_coordinates, coordinates_to_location
-from constants import set_location_to_coordinates
+from patterns.constants import loci, locj
+from patterns.constants import location_to_coordinates
+from patterns.constants import coordinates_to_location
+from patterns.constants import set_location_to_coordinates
+from patterns.constants import coordinates_to_orthogonal_neighbors
 
 
 class Patterns:
@@ -443,7 +446,7 @@ class Patterns:
         ie if there will be at least one legal move for the passive player after the action is taken.
         """
         # Remove the new flipped location and potentially some orthogonals from possible placing locations:
-        removed_orthogonals = orthogonal_neighbors[removed_location]
+        removed_orthogonals = coordinates_to_orthogonal_neighbors[removed_location]
 
         # If False, there will be at least one legal flip action for the passive player:
         is_flipping_move = self._full_flipping_terminal(color, removed_location, removed_orthogonals)
@@ -671,7 +674,7 @@ class Patterns:
         """ update the orthogonal empties for the taken color
         """
         # add empty token orthogonals to the active orthogonal color group:
-        token_orthogonals = orthogonal_neighbors[coords] - self.flipped_locations
+        token_orthogonals = coordinates_to_orthogonal_neighbors[coords] - self.flipped_locations
         self.active_orthogonal_groups[color] |= token_orthogonals
 
     def update_flipping_groups(self, color: int) -> None:

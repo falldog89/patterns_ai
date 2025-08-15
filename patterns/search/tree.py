@@ -42,8 +42,8 @@ import numpy as np
 import random
 from typing import Optional
 
-from game import Patterns
-from node import Node
+from patterns.game import Patterns
+from patterns.search import Node
 
 
 class Tree:

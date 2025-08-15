@@ -11,17 +11,16 @@ This class also includes functionality to create a Patterns game instance from a
 Throughout, all tensors are numpy, as it is far quicker to update and manipulate numpy arrays
 and do a single batch transfer to torch during inference.
 
-todo consider creating games from board state
 """
 
 import numpy as np
 
-from game import Patterns
-from constants import loci, locj
-from constants import EYE
-from constants import SWAP_ACTIVE_PASSIVE_INDEX
-from constants import set_location_to_coordinates
-from constants import orthogonal_neighbors
+from patterns.game import Patterns
+from patterns.constants import loci, locj
+from patterns.constants import EYE
+from patterns.constants import SWAP_ACTIVE_PASSIVE_INDEX
+from patterns.constants import set_location_to_coordinates
+from patterns.constants import coordinates_to_orthogonal_neighbors
 
 
 def create_game_from_state_array(state: np.ndarray) -> Patterns:
@@ -49,7 +48,8 @@ def create_game_from_state_array(state: np.ndarray) -> Patterns:
     new_game._is_no_more_placing = True if numpy_state[42, 0, 0] > 0 else None
 
     # assume that if we are validating, or wishing to create game from state, the game has started proper:
-    # todo reconsider this for the long future, when we are predicting first moves from the board state...
+    # todo reconsider the interaction of this with the earliest moves, when we are predicting first
+    #  moves from the board state...
     new_game.is_game_started = True
     new_game.first_turn_passed = False
 
@@ -135,10 +135,10 @@ def assign_orth_flip_groups(new_game: Patterns):
 
         # find all the orthogonal locations then remove any that are flipped:
         for _coords in active_group:
-            active_orthogs.extend(list(orthogonal_neighbors[_coords]))
+            active_orthogs.extend(list(coordinates_to_orthogonal_neighbors[_coords]))
 
         for _coords in passive_group:
-            passive_orthogs.extend(list(orthogonal_neighbors[_coords]))
+            passive_orthogs.extend(list(coordinates_to_orthogonal_neighbors[_coords]))
 
         new_game.active_orthogonal_groups[_color] = set(active_orthogs) - new_game.flipped_locations
         new_game.passive_orthogonal_groups[_color] = set(passive_orthogs) - new_game.flipped_locations
@@ -218,7 +218,7 @@ def _determine_placing_flag_from_parent(parent_game: Patterns,
     # if the flipped/ placed board token matches the color of the passive bowl token, additional orthogonals
     # could be blocked from play:
     if action_color == token_color:
-        action_block |= orthogonal_neighbors[coords]
+        action_block |= coordinates_to_orthogonal_neighbors[coords]
 
     # remove the flipped location and any relevant orthogonal neighbors from the empty spaces that can be placed in:
     empty_spaces -= action_block
